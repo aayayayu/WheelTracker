@@ -42,7 +42,4 @@ chaquopy {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-ktx:1.9.3")
-    // FFmpeg for Android (community fork; original ffmpeg-kit was removed from Maven Central)
-    implementation("com.moizhassan.ffmpeg:ffmpeg-kit-16kb:6.1.1")
-    implementation("com.arthenica:smart-exception-java:0.2.1")
 }

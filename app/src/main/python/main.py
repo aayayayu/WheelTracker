@@ -1,11 +1,12 @@
 """
-Android entry point. Keeps your original app.py untouched and patches it at runtime:
- 1. cv2.VideoCapture falls back to FFmpeg (ffmpeg-kit) transcoding to MJPEG AVI, then to
-    Android's MediaMetadataRetriever, if OpenCV's build cannot decode the video.
- 2. Mobile-friendly CSS / viewport.
- 3. CSV export goes through the native bridge (WebView can't download blob: URLs).
+Android entry point. Keeps app.py (the Flask app) almost untouched and patches it at runtime:
+ 1. cv2.VideoCapture is replaced by a look-alike backed by Android's MediaMetadataRetriever.
+    No conversion / transcoding step: loading a video is instant.
+ 2. Fast analysis uses the phone's hardware video decoder (FastDecoder.kt) and reads only the
+    tracking box (luma plane), instead of decoding whole colour frames.
+ 3. Mobile-friendly CSS / viewport, and CSV export through the native bridge.
 """
-import os, tempfile
+import os, tempfile, time
 os.environ.setdefault("MPLCONFIGDIR", tempfile.gettempdir())
 
 import numpy as np
@@ -15,7 +16,8 @@ _orig_vc = cv2.VideoCapture
 
 
 class JavaCap:
-    """Minimal cv2.VideoCapture look-alike backed by android.media.MediaMetadataRetriever."""
+    """Minimal cv2.VideoCapture look-alike backed by android.media.MediaMetadataRetriever.
+    Fine for single frames (slider, thumbnails); analysis uses FastDecoder instead."""
 
     def __init__(self, path):
         self.ok, self.pos, self.total, self.fps, self.w, self.h = False, 0, 0, 30.0, 0, 0
@@ -33,6 +35,13 @@ class JavaCap:
             self.total = int(n) if n else 0
             if self.total and dur_ms > 0:
                 self.fps = self.total / (dur_ms / 1000.0)
+            elif dur_ms > 0:
+                cf = g(25)                       # METADATA_KEY_CAPTURE_FRAMERATE
+                try:
+                    self.fps = float(cf) if cf else 30.0
+                except ValueError:
+                    self.fps = 30.0
+                self.total = max(1, int(round(dur_ms / 1000.0 * self.fps)))
             self.ok = self.total > 0
         except Exception as e:
             print("JavaCap open failed:", e)
@@ -56,7 +65,11 @@ class JavaCap:
         if not self.ok or self.pos >= self.total:
             return False, None
         try:
-            bmp = self.r.getFrameAtIndex(self.pos)
+            try:
+                bmp = self.r.getFrameAtIndex(self.pos)
+            except Exception:
+                us = int(self.pos * 1_000_000 / (self.fps or 30.0))
+                bmp = self.r.getFrameAtTime(us, 3)   # OPTION_CLOSEST
             self.pos += 1
             if bmp is None:
                 return False, None
@@ -77,95 +90,65 @@ class JavaCap:
             pass
 
 
-def _transcode(path):
-    """Use FFmpeg (ffmpeg-kit) to make an MJPEG .avi that OpenCV can always read and seek fast."""
-    out = path + ".mjpg.avi"
-    if os.path.exists(out) and os.path.getsize(out) > 0:
-        return out
-    try:
-        from java import jclass, jarray
-        FK = jclass("com.arthenica.ffmpegkit.FFmpegKit")
-        RC = jclass("com.arthenica.ffmpegkit.ReturnCode")
-        args = ["-y", "-i", path, "-an", "-vsync", "0",
-                "-vf", "scale='min(1280,iw)':-2", "-pix_fmt", "yuvj420p",
-                "-c:v", "mjpeg", "-q:v", "3", out]
-        sess = FK.executeWithArguments(jarray(jclass("java.lang.String"))(args))
-        if RC.isSuccess(sess.getReturnCode()):
-            return out
-        print("ffmpeg failed:", sess.getOutput())
-    except Exception as e:
-        print("ffmpeg unavailable:", e)
-    try:
-        os.remove(out)
-    except OSError:
-        pass
-    return None
-
-
-def _frames_differ(a, b):
-    if a is None or b is None or a.shape != b.shape:
-        return True
-    # Downscale-free cheap check: mean absolute difference on a subsample.
-    diff = cv2.absdiff(a[::4, ::4], b[::4, ::4])
-    return float(diff.mean()) > 1.0
-
-
-def _try_open(path):
-    """Open with OpenCV and verify SEEKING actually works, not just reading frame 0.
-    Some Android OpenCV builds decode frame 0 fine but silently ignore
-    CAP_PROP_POS_FRAMES, which makes every later /render call return the same
-    (or no) frame. Reject that backend here so the caller falls through to
-    FFmpeg / MediaMetadataRetriever instead."""
-    c = _orig_vc(path)
-    try:
-        if not c.isOpened():
-            raise RuntimeError("not opened")
-        ok0, frame0 = c.read()
-        if not ok0:
-            raise RuntimeError("cannot read frame 0")
-
-        total = int(c.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        if total <= 1:
-            # Can't verify seeking on a 1-frame clip; accept as-is.
-            c.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            return c
-
-        target = min(total - 1, max(1, total // 2))
-        seek_ok = c.set(cv2.CAP_PROP_POS_FRAMES, target)
-        ok1, frame1 = c.read()
-        actual_pos = int(c.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-
-        works = bool(seek_ok) and ok1 and (actual_pos > 1) and _frames_differ(frame0, frame1)
-        if not works:
-            raise RuntimeError(f"seek not honored (asked {target}, landed {actual_pos})")
-
-        c.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        return c
-    except Exception as e:
-        print("OpenCV backend rejected:", e)
-        try:
-            c.release()
-        except Exception:
-            pass
-        return None
-
-
 def _video_capture(path, *a):
-    # 1) OpenCV directly  2) FFmpeg -> MJPEG AVI -> OpenCV  3) MediaMetadataRetriever
-    c = _try_open(path)
-    if c is not None:
+    c = JavaCap(path)
+    if c.isOpened():
         return c
-    print("OpenCV cannot decode this video; transcoding with FFmpeg")
-    t = _transcode(path)
-    if t:
-        c = _try_open(t)
-        if c is not None:
-            return c
-    print("FFmpeg path failed; using Android MediaMetadataRetriever")
-    return JavaCap(path)
+    print("MediaMetadataRetriever could not open the video; trying OpenCV")
+    return _orig_vc(path, *a)
 
 
 cv2.VideoCapture = _video_capture
+
+
+# ---------------- hardware-decoder range reader ----------------
+_LIMITED_LUT = np.clip((np.arange(256) - 16) * 255.0 / 219.0, 0, 255).astype(np.uint8)
+
+
+def _to_np(jarr):
+    """Java byte[] -> uint8 numpy array."""
+    try:
+        return np.frombuffer(jarr, dtype=np.uint8)          # buffer protocol (fast)
+    except Exception:
+        return np.array(jarr, dtype=np.int8).view(np.uint8)  # slow but always works
+
+
+def _to_gray(f):
+    a = _to_np(f.data).reshape(f.h, f.w)
+    if not f.full:                      # limited-range luma (16..235) -> full 0..255
+        a = cv2.LUT(a, _LIMITED_LUT)
+    k = (4 - int(f.rotation) // 90) % 4  # raw frame -> displayed orientation
+    if k:
+        a = np.ascontiguousarray(np.rot90(a, k))
+    return a
+
+
+def hw_range_reader(sess, sf, ef, rect):
+    """Yield (frame_index, gray ROI) for frames [sf, ef) using MediaCodec."""
+    from java import jclass
+    FD = jclass("com.example.wheeltracker.FastDecoder")
+    x0, y0, x1, y1 = rect
+    s = FD.open(sess['video_path'], int(sf), int(ef), float(sess['fps']),
+                int(x0), int(y0), int(x1), int(y1))
+    n = 0
+    try:
+        while True:
+            f = s.poll()
+            if f is None:
+                if s.isDone():
+                    break
+                time.sleep(0.001)
+                continue
+            n += 1
+            yield int(f.idx), _to_gray(f)
+        err = s.errorMessage()
+        if err:
+            raise RuntimeError(err)
+        if n == 0:
+            raise RuntimeError("hardware decoder returned no frames")
+    finally:
+        s.close()
+
 
 MOBILE_CSS = """
 button{min-height:40px}
@@ -181,6 +164,7 @@ button{min-height:40px}
 
 def start():
     import app as wt
+    wt.RANGE_READER = hw_range_reader
     t = wt.TEMPLATE
     t = t.replace('<meta charset="utf-8">',
                   '<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">', 1)

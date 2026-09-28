@@ -1,7 +1,7 @@
 """
 Edge-On Wheel Rotation Counter — Flask Web Edition
 """
-import os, io, csv, math, base64, uuid, json as _json, tempfile
+import os, io, csv, math, base64, uuid, json as _json, tempfile, threading, queue, time
 import numpy as np, cv2, matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -99,68 +99,124 @@ def grab_frames(path, indices):
     return out
 
 
+_K5 = np.ones((5, 5), np.uint8)
+_PAD = 6   # >= reach of the open(1x)+close(2x) 5x5 morphology
+
+
+def _empty_res():
+    return {'found': False, 'mask': None, 'y': None, 'state': 'hidden', 'area': 0, 'rect': None}
+
+
+def roi_rect(p, W, H):
+    """Tracking box (x0, y0, x1, y1) clamped to the frame, or None if not usable."""
+    yt, yb, xl, xr = p['y_top'], p['y_bottom'], p['x_left'], p['x_right']
+    if None in (yt, yb, xl, xr): return None
+    y0, y1 = max(0, min(yt, yb)), min(H, max(yt, yb))
+    x0, x1 = max(0, min(xl, xr)), min(W, max(xl, xr))
+    if y1 <= y0 or x1 <= x0: return None
+    return x0, y0, x1, y1
+
+
+def detect_gray(gray, x0, y0, p):
+    """Detect the tape in an already-cropped grayscale ROI whose top-left corner is
+    (x0, y0) in the full frame. Returned y / rect are in full-frame coordinates."""
+    res = _empty_res()
+    yt, yb = p['y_top'], p['y_bottom']
+    _, m = cv2.threshold(gray, p['black_thresh'], 255, cv2.THRESH_BINARY_INV)
+    m = cv2.copyMakeBorder(m, _PAD, _PAD, _PAD, _PAD, cv2.BORDER_CONSTANT, value=0)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, _K5, iterations=1)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, _K5, iterations=2)
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    ox, oy = x0 - _PAD, y0 - _PAD
+    cands = []
+    for c in cnts:
+        a = cv2.contourArea(c)
+        if a < p['min_area'] or (p['max_area'] > 0 and a > p['max_area']): continue
+        x, y, w, h = cv2.boundingRect(c)
+        cands.append({'area': a, 'cy': y + h / 2.0 + oy, 'rect': (x + ox, y + oy, w, h)})
+    if not cands: return res
+    ch = max(cands, key=lambda c: c['area'])
+    span = (yb - yt) or 1
+    ny = (ch['cy'] - yt) / span
+    state = 'top' if ny < 0.33 else ('mid' if ny < 0.66 else 'bottom')
+    res.update(found=True, y=ch['cy'], state=state, area=ch['area'], rect=ch['rect'])
+    return res
+
+
+def process_frame_roi(frame, p):
+    """Same result as process_frame() but only touches the ROI (much faster)."""
+    rect = roi_rect(p, frame.shape[1], frame.shape[0])
+    if rect is None: return _empty_res()
+    x0, y0, x1, y1 = rect
+    return detect_gray(cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY), x0, y0, p)
+
+
+def _reader(cap, n, q, stop):
+    """Decode frames on a separate thread so decoding and analysis overlap."""
+    try:
+        for _ in range(n):
+            if stop.is_set(): return
+            ret, fr = cap.read()
+            if not ret: break
+            while not stop.is_set():
+                try: q.put(fr, timeout=0.2); break
+                except queue.Full: pass
+    finally:
+        while not stop.is_set():
+            try: q.put(None, timeout=0.2); break
+            except queue.Full: pass
+
+
 # ---------- Analysis stream ----------
-def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None):
-    fps, total = sess['fps'], sess['total_frames']
-    sf = max(0, int(t0 * fps)) if t0 is not None else 0
-    ef = min(total, int(t1 * fps)) if t1 is not None else total
-    seq = ['top', 'mid', 'bottom', 'hidden'] if p['direction'] == 'down' \
-          else ['bottom', 'mid', 'top', 'hidden']
+class RotationCounter:
+    """Sequential state machine (debounce + top/mid/bottom/hidden sequence).
+    Cheap, so it always runs once, in order, over per-frame detections."""
 
-    cap = cv2.VideoCapture(sess['video_path'])
-    if sf: cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
+    def __init__(self, p, fps):
+        self.p, self.fps = p, fps
+        self.seq = ['top', 'mid', 'bottom', 'hidden'] if p['direction'] == 'down' \
+                   else ['bottom', 'mid', 'top', 'hidden']
+        self.exp, self.cand, self.ccnt, self.stable = 0, None, 0, None
+        self.rot, self.rtimes, self.cum = 0, [], 0.0
+        self.prev, self.max_jump, self.hist = None, 0.0, []
 
-    exp, cand, ccnt, stable = 0, None, 0, None
-    rot, rtimes, cum = 0, [], 0.0
-    prev, max_jump, hist = None, 0.0, []
-
-    fi, proc = sf, 0
-    while fi < ef:
-        ret, frame = cap.read()
-        if not ret: break
-        t = fi / fps if fps > 0 else 0.0
-        res = process_frame(frame, p)
+    def step(self, fi, res):
+        p, seq = self.p, self.seq
+        t = fi / self.fps if self.fps > 0 else 0.0
         st = res['state']
-
-        if st == cand: ccnt += 1
-        else: cand, ccnt = st, 1
-        if ccnt >= p['debounce'] and st != stable:
-            first = stable is None
-            stable = st
+        if st == self.cand: self.ccnt += 1
+        else: self.cand, self.ccnt = st, 1
+        if self.ccnt >= p['debounce'] and st != self.stable:
+            first = self.stable is None
+            self.stable = st
             if first:
-                if st in seq: exp = (seq.index(st) + 1) % 4
+                if st in seq: self.exp = (seq.index(st) + 1) % 4
             else:
-                if st == seq[exp]:
-                    exp = (exp + 1) % 4
-                    if exp == 0: rot += 1; rtimes.append(t)
+                if st == seq[self.exp]:
+                    self.exp = (self.exp + 1) % 4
+                    if self.exp == 0: self.rot += 1; self.rtimes.append(t)
                 elif not p['strict'] and st in seq:
-                    exp = (seq.index(st) + 1) % 4
-                    if exp == 0: rot += 1; rtimes.append(t)
-
+                    self.exp = (seq.index(st) + 1) % 4
+                    if self.exp == 0: self.rot += 1; self.rtimes.append(t)
         th = None
         if res['found']:
             th = angle_from_y(res['y'], p)
-            cum = rot * 360.0 + th
-            if prev is not None: max_jump = max(max_jump, abs(cum - prev))
-            prev = cum
+            self.cum = self.rot * 360.0 + th
+            if self.prev is not None: self.max_jump = max(self.max_jump, abs(self.cum - self.prev))
+            self.prev = self.cum
+        self.hist.append({'frame': fi, 'time_s': round(t, 5),
+                          'y_position': res['y'] if res['found'] else None,
+                          'unwrapped_angle_deg': self.cum if res['found'] else None,
+                          'state': st, 'stable_state': self.stable, 'rotation_count': self.rot})
+        return th
 
-        hist.append({'frame': fi, 'time_s': round(t, 5),
-                     'y_position': res['y'] if res['found'] else None,
-                     'unwrapped_angle_deg': cum if res['found'] else None,
-                     'state': st, 'stable_state': stable, 'rotation_count': rot})
 
-        if live and proc % every == 0:
-            yield {'preview': {'frame': fi, 'time_s': round(t, 5),
-                               'image': encode_jpeg(annotate(frame, res, p, sess)),
-                               'state': st, 'found': res['found'], 'angle': th,
-                               'rotation_count': rot, 'total_frames': ef - sf,
-                               'start_frame': sf}}
-        fi += 1; proc += 1
-    cap.release()
-
+def finish_event(ctr, proc, sf, ef, total, fps, extra=()):
+    rot, rtimes, hist, max_jump = ctr.rot, ctr.rtimes, ctr.hist, ctr.max_jump
     total_time = proc / fps if fps > 0 else 0.0
     L = ["Analysis completed.", f"Frames processed: {proc}",
          f"Video duration processed: {total_time:.2f} s"]
+    L += list(extra)
     if sf or ef < total:
         L.append(f"Time crop: {sf / fps:.2f}s to {ef / fps:.2f}s")
     L.append(f"Total full rotations counted: {rot}")
@@ -192,8 +248,139 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None):
     plt.close(fig); buf.seek(0)
     plot = 'data:image/png;base64,' + base64.b64encode(buf.read()).decode()
 
-    yield {'done': True, 'summary': summary, 'rotation_count': rot,
-           'history': hist, 'plot': plot, 'start_frame': sf, 'end_frame': ef}
+    return {'done': True, 'summary': summary, 'rotation_count': rot,
+            'history': hist, 'plot': plot, 'start_frame': sf, 'end_frame': ef}
+
+
+def _frame_range(sess, t0, t1):
+    fps, total = sess['fps'], sess['total_frames']
+    sf = max(0, int(t0 * fps)) if t0 is not None else 0
+    ef = min(total, int(t1 * fps)) if t1 is not None else total
+    return fps, total, sf, ef
+
+
+def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None):
+    """Frame-by-frame analysis with optional live preview (needs full colour frames)."""
+    fps, total, sf, ef = _frame_range(sess, t0, t1)
+    cap = cv2.VideoCapture(sess['video_path'])
+    if sf: cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
+    q, stop = queue.Queue(maxsize=24), threading.Event()
+    rd = threading.Thread(target=_reader, args=(cap, max(0, ef - sf), q, stop), daemon=True)
+    rd.start()
+    t_start, last_prev = time.time(), 0.0
+    ctr = RotationCounter(p, fps)
+    fi, proc = sf, 0
+    try:
+        while fi < ef:
+            frame = q.get()
+            if frame is None: break
+            res = process_frame_roi(frame, p)
+            th = ctr.step(fi, res)
+            now = time.time()
+            if live and proc % every == 0 and now - last_prev > 0.35:
+                last_prev = now
+                yield {'preview': {'frame': fi, 'time_s': round(fi / fps if fps > 0 else 0.0, 5),
+                                   'image': encode_jpeg(annotate(frame, res, p, sess)),
+                                   'state': res['state'], 'found': res['found'], 'angle': th,
+                                   'rotation_count': ctr.rot, 'total_frames': ef - sf,
+                                   'start_frame': sf}}
+            fi += 1; proc += 1
+    finally:
+        stop.set()
+        rd.join(timeout=2)
+        cap.release()
+    dt = max(1e-6, time.time() - t_start)
+    print(f"ANALYSIS: {proc} frames in {dt:.1f}s ({proc / dt:.0f} fps)")
+    yield finish_event(ctr, proc, sf, ef, total, fps)
+
+
+# ---- Fast / parallel analysis: read only the ROI, split the video into parts ----
+def cv_range_reader(sess, sf, ef, rect):
+    """Generic reader: yields (frame_index, gray ROI). Android replaces RANGE_READER with
+    a hardware-decoder version (see main.py)."""
+    x0, y0, x1, y1 = rect
+    cap = cv2.VideoCapture(sess['video_path'])
+    try:
+        if sf: cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
+        for i in range(sf, ef):
+            ok, fr = cap.read()
+            if not ok: break
+            yield i, cv2.cvtColor(fr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+    finally:
+        cap.release()
+
+
+RANGE_READER = cv_range_reader
+
+
+def run_parallel_stream(sess, p, parts=2, t0=None, t1=None):
+    """Split [start, end) into `parts` chunks, detect the tape in each chunk on its own
+    thread (per-frame detection is independent), then run the rotation state machine ONCE,
+    in order, over the merged detections. Result is identical to a sequential run, and
+    there is nothing to reconcile at chunk boundaries."""
+    fps, total, sf, ef = _frame_range(sess, t0, t1)
+    rect = roi_rect(p, sess['orig_w'], sess['orig_h'])
+    if rect is None:
+        yield {'error': 'Tracking box is empty or outside the frame.'}; return
+    n_frames = ef - sf
+    if n_frames <= 0:
+        yield {'error': 'Nothing to analyse (empty time range).'}; return
+    n = max(1, min(int(parts), 8, n_frames))
+    edges = [sf + n_frames * k // n for k in range(n + 1)]
+    results = [[] for _ in range(n)]
+    counts, errs, notes = [0] * n, [None] * n, []
+    stop = threading.Event()
+
+    def consume(k, reader):
+        out = results[k]
+        for i, g in reader:
+            if stop.is_set(): return
+            r = detect_gray(g, rect[0], rect[1], p)
+            out.append((i, r['found'], r['y'], r['state']))
+            counts[k] = len(out)
+
+    def worker(k):
+        a, b = edges[k], edges[k + 1]
+        try:
+            consume(k, RANGE_READER(sess, a, b, rect))
+        except Exception as e:
+            if RANGE_READER is cv_range_reader:
+                errs[k] = str(e); return
+            notes.append(f"Part {k + 1}: fast decoder failed ({e}); used slow fallback")
+            results[k].clear(); counts[k] = 0
+            try:
+                consume(k, cv_range_reader(sess, a, b, rect))
+            except Exception as e2:
+                errs[k] = str(e2)
+
+    t_start = time.time()
+    ths = [threading.Thread(target=worker, args=(k,), daemon=True) for k in range(n)]
+    try:
+        for t in ths: t.start()
+        while any(t.is_alive() for t in ths):
+            time.sleep(0.25)
+            d = sum(counts)
+            yield {'progress': min(0.99, d / n_frames), 'done_frames': d,
+                   'total': n_frames, 'parts': n}
+        for t in ths: t.join()
+    finally:
+        stop.set()
+    if any(errs):
+        yield {'error': next(e for e in errs if e)}; return
+    dets = [x for r in results for x in r]
+    if not dets:
+        yield {'error': 'No frames could be decoded.'}; return
+    wall = max(1e-6, time.time() - t_start)
+    ctr = RotationCounter(p, fps)
+    for i, found, y, state in dets:
+        ctr.step(i, {'found': found, 'y': y, 'state': state})
+    extra = [f"Parallel parts: {n}",
+             f"Processing time: {wall:.2f} s ({len(dets) / wall:.0f} frames/s)"]
+    if len(dets) < n_frames:
+        extra.append(f"Warning: decoded {len(dets)} of {n_frames} frames")
+    extra += notes
+    print(f"PARALLEL ANALYSIS: {len(dets)} frames, {n} parts, {wall:.1f}s ({len(dets) / wall:.0f} fps)")
+    yield finish_event(ctr, len(dets), sf, ef, total, fps, extra)
 
 
 # ---------- Routes ----------
@@ -287,7 +474,35 @@ def analyze():
 
     def gen():
         try:
-            for ev in run_analysis_stream(sess, p, live, every, t0, t1):
+            # Without live preview no colour frames are needed: use the fast ROI-only path.
+            it = run_analysis_stream(sess, p, live, every, t0, t1) if live \
+                 else run_parallel_stream(sess, p, 1, t0, t1)
+            for ev in it:
+                yield 'data: ' + _json.dumps(ev) + '\n\n'
+        except Exception as e:
+            yield 'data: ' + _json.dumps({'error': str(e)}) + '\n\n'
+    return Response(gen(), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+
+@app.route('/fast_analyze', methods=['POST'])
+def fast_analyze():
+    d = request.get_json(force=True)
+    sess = SESSIONS.get(d.get('sid'))
+    if not sess: return jsonify({'error': 'invalid session'}), 400
+    p = extract_params(d)
+    if None in (p['y_top'], p['y_bottom'], p['x_left'], p['x_right']):
+        return jsonify({'error': 'Set TOP, BOTTOM, LEFT, RIGHT boundaries first.'}), 400
+    parts = max(1, min(int(d.get('parts', 2) or 2), 8))
+    t0 = d.get('time_start'); t1 = d.get('time_end')
+    t0 = max(0.0, float(t0)) if t0 is not None else None
+    t1 = max(0.0, float(t1)) if t1 is not None else None
+    if t0 is not None and t1 is not None and t1 <= t0:
+        return jsonify({'error': 'End time must be greater than start time.'}), 400
+
+    def gen():
+        try:
+            for ev in run_parallel_stream(sess, p, parts, t0, t1):
                 yield 'data: ' + _json.dumps(ev) + '\n\n'
         except Exception as e:
             yield 'data: ' + _json.dumps({'error': str(e)}) + '\n\n'
@@ -382,6 +597,7 @@ progress::-moz-progress-bar{background:#4299e1}
 <div class="tabbar">
   <button id="tabAnalysis" class="active" onclick="showTab('analysis')">Analysis</button>
   <button id="tabCrop" onclick="showTab('crop')">Time Crop</button>
+  <button id="tabFast" onclick="showTab('fast')">Parallel</button>
 </div>
 
 <!-- ============ ANALYSIS PAGE ============ -->
@@ -453,7 +669,7 @@ progress::-moz-progress-bar{background:#4299e1}
     <div class="panel">
       <h3>Run Analysis <span id="liveBadge" class="badge live-badge">LIVE</span></h3>
       <div class="row"><input type="checkbox" id="livePreview" checked>
-        <label for="livePreview">Show live frame-by-frame preview</label></div>
+        <label for="livePreview">Show live frame-by-frame preview (slower)</label></div>
       <div class="row"><label style="flex:1">Preview every N frames</label>
         <input type="number" id="previewEvery" value="3" min="1" max="60" style="width:70px"></div>
       <div class="row">
@@ -543,7 +759,40 @@ progress::-moz-progress-bar{background:#4299e1}
     <div class="row">
       <button class="secondary" onclick="resetCropToFull()">Reset to full video</button>
       <button onclick="applyCropToAnalysis()">Apply &amp; go to Analysis</button>
+      <button onclick="applyCropToFast()">Apply &amp; go to Parallel</button>
     </div>
+  </div>
+</div>
+</div>
+
+<!-- ============ PARALLEL PAGE ============ -->
+<div id="pageFast" class="page">
+<div class="crop-page">
+  <div class="panel">
+    <h3>Parallel Analysis <span class="badge live-badge" id="fastBadge">RUNNING</span></h3>
+    <div class="hint" style="font-size:12px;color:#888;margin-bottom:8px">
+      Uses the video, tracking box and detection settings from the Analysis tab. The video is
+      split into parts that are decoded and analysed at the same time; rotations are then counted
+      once, in order, so the result is the same as a normal run.</div>
+    <div id="fastRoiInfo" class="status">Tracking box: not set</div>
+    <div class="row"><label style="flex:1">Parallel parts (1-8)</label>
+      <input type="number" id="fastParts" value="2" min="1" max="8" style="width:70px"></div>
+    <div class="row"><input type="checkbox" id="fastCrop">
+      <label for="fastCrop">Use crop range from Time Crop page</label></div>
+    <div id="fastCropInfo" class="status">Crop: full video</div>
+    <div class="row"><button class="secondary" onclick="showTab('crop')">Open Time Crop page</button></div>
+    <div class="row">
+      <button id="btnFast" onclick="runFast()">Run Parallel Analysis</button>
+      <button class="secondary" onclick="resetAnalysis()">Reset</button>
+    </div>
+    <progress id="fastProgress" value="0" max="100"></progress>
+    <div id="fastStatus" class="status">Load a video on the Analysis tab first.</div>
+  </div>
+  <div class="panel">
+    <h3>Results</h3>
+    <pre class="summary" id="fastSummary">Run an analysis to see results here.</pre>
+    <div class="row" style="margin-top:10px"><button onclick="exportCSV()">Export CSV</button></div>
+    <img id="fastPlot" class="plot" style="display:none">
   </div>
 </div>
 </div>
@@ -567,13 +816,22 @@ const postJSON = async (url, body) => (await fetch(url, {
   body: JSON.stringify(body)})).json();
 
 function showTab(name) {
-  $('pageAnalysis').classList.toggle('active', name === 'analysis');
-  $('pageCrop').classList.toggle('active', name === 'crop');
-  $('tabAnalysis').classList.toggle('active', name === 'analysis');
-  $('tabCrop').classList.toggle('active', name === 'crop');
+  [['analysis','Analysis'], ['crop','Crop'], ['fast','Fast']].forEach(([n, cap]) => {
+    $('page' + cap).classList.toggle('active', name === n);
+    $('tab' + cap).classList.toggle('active', name === n);
+  });
   if (name === 'crop' && S.sid && !$('startStrip').dataset.loaded) {
     loadStartWindow(); loadEndWindow();
   }
+  if (name === 'fast') updateFastRoi();
+}
+
+function updateFastRoi() {
+  const ok = [S.y_top, S.y_bottom, S.x_left, S.x_right].every(v => v !== null);
+  $('fastRoiInfo').textContent = !S.sid ? 'No video loaded (use the Analysis tab).'
+    : ok ? `Tracking box: x ${Math.min(S.x_left, S.x_right)}-${Math.max(S.x_left, S.x_right)}, ` +
+           `y ${Math.min(S.y_top, S.y_bottom)}-${Math.max(S.y_top, S.y_bottom)}`
+         : 'Tracking box: not set (set TOP, BOTTOM, LEFT, RIGHT on the Analysis tab).';
 }
 
 function getParams() {
@@ -608,7 +866,9 @@ async function uploadVideo() {
   $('lblCount').textContent = '0';
   $('summary').textContent = 'Run an analysis to see results here.';
   $('plot').style.display = 'none';
-  updateCropBadge(); updateCropBar(); renderFrame();
+  $('fastSummary').textContent = 'Run an analysis to see results here.';
+  $('fastPlot').style.display = 'none'; $('fastStatus').textContent = '';
+  updateCropBadge(); updateCropBar(); updateCropInfo(); renderFrame();
   $('startStrip').dataset.loaded = ''; $('endStrip').dataset.loaded = '';
   if ($('pageCrop').classList.contains('active')) { loadStartWindow(); loadEndWindow(); }
 }
@@ -651,7 +911,7 @@ $('frameImg').addEventListener('click', e => {
   S.pickMode = null;
   ['top','bottom','left','right'].forEach(m =>
     $('btn' + m[0].toUpperCase() + m.slice(1)).classList.remove('pick-active'));
-  renderFrame();
+  updateFastRoi(); renderFrame();
 });
 
 // ---- Threshold ----
@@ -676,6 +936,9 @@ function updateCropInfo() {
   $('cropInfo').textContent = full ? 'Crop: full video'
     : `Crop: ${S.cropStart.toFixed(2)}s → ${S.cropEnd.toFixed(2)}s (${(S.cropEnd - S.cropStart).toFixed(2)}s)`;
 }
+
+const _updateCropInfo = updateCropInfo;
+updateCropInfo = function () { _updateCropInfo(); $('fastCropInfo').textContent = $('cropInfo').textContent; };
 
 function updateCropBar() {
   $('barStart').textContent = S.cropStart.toFixed(2) + ' s';
@@ -752,13 +1015,16 @@ function resetCropToFull() {
   updateCropBar(); updateCropInfo(); updateCropBadge();
 }
 
-function applyCropToAnalysis() {
+function applyCrop(target) {
   if (!S.sid) return alert('Load a video first.');
   const full = S.cropStart <= 0.001 && Math.abs(S.cropEnd - S.duration) <= 0.001;
   $('enableCrop').checked = !full;
+  $('fastCrop').checked = !full;
   updateCropBadge();
-  showTab('analysis');
+  showTab(target);
 }
+const applyCropToAnalysis = () => applyCrop('analysis');
+const applyCropToFast = () => applyCrop('fast');
 
 // ---- Analysis ----
 async function runAnalysis() {
@@ -826,6 +1092,66 @@ async function runAnalysis() {
   }
 }
 
+async function runFast() {
+  if (!S.sid) return alert('Load a video on the Analysis tab first.');
+  if (S.y_top === null || S.y_bottom === null || S.x_left === null || S.x_right === null)
+    return alert('Set TOP, BOTTOM, LEFT, RIGHT boundaries on the Analysis tab first.');
+  const cropOn = $('fastCrop').checked;
+  if (cropOn && S.cropEnd <= S.cropStart) return alert('End time must be greater than start time.');
+  const btn = $('btnFast'), badge = $('fastBadge');
+  S.analyzing = true; btn.disabled = true; btn.textContent = 'Analyzing...';
+  badge.classList.add('active'); $('fastProgress').value = 1;
+  $('fastStatus').textContent = 'Starting...';
+  const p = getParams();
+  p.parts = Math.max(1, Math.min(8, +$('fastParts').value || 2));
+  if (cropOn) { p.time_start = S.cropStart; p.time_end = S.cropEnd; }
+  const t0 = performance.now();
+  try {
+    const resp = await fetch('/fast_analyze', {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify(p)});
+    if (!resp.ok || !resp.body) {
+      let m = 'Analysis failed';
+      try { m = (await resp.json()).error || m; } catch {}
+      return alert(m);
+    }
+    const reader = resp.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let i;
+      while ((i = buf.indexOf('\n\n')) !== -1) {
+        const raw = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
+        if (!raw.startsWith('data:')) continue;
+        let ev; try { ev = JSON.parse(raw.slice(5).trim()); } catch { continue; }
+        if (ev.error) return alert(ev.error);
+        if (ev.progress !== undefined) {
+          $('fastProgress').value = ev.progress * 100;
+          $('fastStatus').textContent =
+            `Processed ${ev.done_frames} / ${ev.total} frames (${ev.parts} parts)`;
+        }
+        if (ev.done) {
+          S.history = ev.history || [];
+          $('fastSummary').textContent = ev.summary; $('summary').textContent = ev.summary;
+          $('lblCount').textContent = ev.rotation_count;
+          if (ev.plot) {
+            $('fastPlot').src = ev.plot; $('fastPlot').style.display = 'block';
+            $('plot').src = ev.plot; $('plot').style.display = 'block';
+          }
+          $('fastProgress').value = 100;
+          $('fastStatus').textContent =
+            `Finished in ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+        }
+      }
+    }
+  } catch (e) { alert('Analysis error: ' + e.message); }
+  finally {
+    S.analyzing = false; btn.disabled = false; btn.textContent = 'Run Parallel Analysis';
+    badge.classList.remove('active');
+  }
+}
+
 function resetAnalysis() {
   S.history = [];
   $('summary').textContent = 'Run an analysis to see results here.';
@@ -833,6 +1159,9 @@ function resetAnalysis() {
   $('lblAngle').textContent = '-'; $('lblExpect').textContent = 'top';
   $('lblTime').textContent = '0.00s'; $('plot').style.display = 'none';
   $('progress').value = 0; $('moiResult').textContent = 'I = -';
+  $('fastSummary').textContent = 'Run an analysis to see results here.';
+  $('fastPlot').style.display = 'none'; $('fastProgress').value = 0;
+  $('fastStatus').textContent = '';
 }
 
 // ---- CSV ----
