@@ -114,7 +114,15 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        val closing = isFinishing
         web.destroy()
         super.onDestroy()
+        if (closing) {
+            // App is being closed: delete the cached copy of the video so the cache does not pile up.
+            // (On a background thread; it must never block the UI while Python is busy.)
+            Thread {
+                try { Python.getInstance().getModule("main").callAttr("cleanup") } catch (_: Exception) {}
+            }.start()
+        }
     }
 }

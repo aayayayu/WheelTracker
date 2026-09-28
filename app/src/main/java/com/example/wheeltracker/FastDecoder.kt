@@ -7,7 +7,14 @@ import android.media.MediaFormat
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 
-/** One decoded frame: the luma (grayscale) values of the tracking box, in the video's raw orientation. */
+/** Width (px) of the optional live-preview picture. */
+private const val PREVIEW_W = 640
+
+/**
+ * One decoded frame: the luma (grayscale) values of the tracking box, in the video's raw orientation.
+ * pdata (may be null) is a down-scaled luma picture of the WHOLE frame (pw x ph, same raw orientation),
+ * only filled in now and then when a live preview was requested.
+ */
 class FdFrame(
     @JvmField val idx: Int,
     @JvmField val w: Int,
@@ -15,6 +22,9 @@ class FdFrame(
     @JvmField val full: Boolean,
     @JvmField val rotation: Int,
     @JvmField val data: ByteArray,
+    @JvmField val pw: Int = 0,
+    @JvmField val ph: Int = 0,
+    @JvmField val pdata: ByteArray? = null,
 )
 
 /**
@@ -28,11 +38,15 @@ class FdSession(
     private val endFrame: Int,
     private val fps: Double,
     private val dx0: Int, private val dy0: Int, private val dx1: Int, private val dy1: Int,
+    private val previewEvery: Int,   // 0 = no preview pictures
+    private val previewMs: Int,      // at most one preview picture per this many milliseconds
 ) {
     private val queue = ArrayBlockingQueue<FdFrame>(32)
     @Volatile private var finished = false
     @Volatile private var stopFlag = false
     @Volatile private var err: String? = null
+    private var havePreview = false
+    private var lastPreviewNs = 0L
 
     private val worker = Thread { run() }.apply { isDaemon = true; start() }
 
@@ -130,9 +144,14 @@ class FdSession(
                     if (idx >= endFrame) {
                         outputDone = true
                     } else if (idx >= startFrame && info.size > 0) {
+                        val nowNs = System.nanoTime()
+                        val wantPrev = previewEvery > 0 &&
+                            (idx - startFrame) % previewEvery == 0 &&
+                            (!havePreview || nowNs - lastPreviewNs >= previewMs * 1_000_000L)
                         val frame = extract(c, oi, info, idx, rotation, fullRange,
-                            rect, rectW, rectH)
+                            rect, rectW, rectH, wantPrev)
                         if (frame != null) {
+                            if (frame.first.pdata != null) { havePreview = true; lastPreviewNs = nowNs }
                             rect = frame.second; rectW = frame.third; rectH = frame.fourth
                             if (!offer(frame.first)) outputDone = true
                         }
@@ -164,6 +183,7 @@ class FdSession(
     private fun extract(
         c: MediaCodec, oi: Int, info: MediaCodec.BufferInfo, idx: Int, rotation: Int,
         fullRange: Boolean, cachedRect: IntArray?, cachedW: Int, cachedH: Int,
+        wantPrev: Boolean,
     ): Quad<FdFrame, IntArray, Int, Int>? {
         val img = try { c.getOutputImage(oi) } catch (_: Throwable) { null }
         if (img != null) {
@@ -191,7 +211,25 @@ class FdSession(
                         for (col in 0 until cw) out[row * cw + col] = bb.get(base + col * ps + (ps - 1))
                     }
                 }
-                return Quad(FdFrame(idx, cw, ch, fullRange, rotation, out), r, rw, rh)
+                var pw = 0
+                var ph = 0
+                var pd: ByteArray? = null
+                if (wantPrev) {
+                    try {
+                        val step = maxOf(1, (rw + PREVIEW_W - 1) / PREVIEW_W)
+                        val w2 = rw / step
+                        val h2 = rh / step
+                        if (w2 > 0 && h2 > 0) {
+                            val tmp = ByteArray(w2 * h2)
+                            for (row in 0 until h2) {
+                                val rb = (crop.top + row * step) * rs + crop.left * ps
+                                for (col in 0 until w2) tmp[row * w2 + col] = bb.get(rb + col * step * ps + (ps - 1))
+                            }
+                            pd = tmp; pw = w2; ph = h2
+                        }
+                    } catch (_: Throwable) { pd = null; pw = 0; ph = 0 }
+                }
+                return Quad(FdFrame(idx, cw, ch, fullRange, rotation, out, pw, ph, pd), r, rw, rh)
             } finally {
                 img.close()
             }
@@ -219,15 +257,38 @@ class FdSession(
             ob.position(info.offset + (ct + r[1] + row) * rs + cl + r[0])
             ob.get(out, row * cw, cw)
         }
-        return Quad(FdFrame(idx, cw, ch, fullRange, rotation, out), r, rw, rh)
+        var pw = 0
+        var ph = 0
+        var pd: ByteArray? = null
+        if (wantPrev) {
+            try {
+                val step = maxOf(1, (rw + PREVIEW_W - 1) / PREVIEW_W)
+                val w2 = rw / step
+                val h2 = rh / step
+                if (w2 > 0 && h2 > 0) {
+                    val tmp = ByteArray(w2 * h2)
+                    for (row in 0 until h2) {
+                        val rb = info.offset + (ct + row * step) * rs + cl
+                        for (col in 0 until w2) tmp[row * w2 + col] = ob.get(rb + col * step)
+                    }
+                    pd = tmp; pw = w2; ph = h2
+                }
+            } catch (_: Throwable) { pd = null; pw = 0; ph = 0 }
+        }
+        return Quad(FdFrame(idx, cw, ch, fullRange, rotation, out, pw, ph, pd), r, rw, rh)
     }
 }
 
 object FastDecoder {
-    /** Starts decoding [startFrame, endFrame); the box is x0,y0,x1,y1 in displayed pixels. */
+    /**
+     * Starts decoding [startFrame, endFrame); the box is x0,y0,x1,y1 in displayed pixels.
+     * previewEvery > 0 also attaches a small whole-frame luma picture to every previewEvery-th
+     * frame, but at most one per previewMs milliseconds.
+     */
     @JvmStatic
     fun open(
         path: String, startFrame: Int, endFrame: Int, fps: Double,
         x0: Int, y0: Int, x1: Int, y1: Int,
-    ): FdSession = FdSession(path, startFrame, endFrame, fps, x0, y0, x1, y1)
+        previewEvery: Int, previewMs: Int,
+    ): FdSession = FdSession(path, startFrame, endFrame, fps, x0, y0, x1, y1, previewEvery, previewMs)
 }

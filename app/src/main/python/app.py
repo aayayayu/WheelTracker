@@ -1,7 +1,8 @@
 """
 Edge-On Wheel Rotation Counter — Flask Web Edition
 """
-import os, io, csv, math, base64, uuid, json as _json, tempfile, threading, queue, time
+import os, io, re, csv, math, base64, uuid, shutil, collections, json as _json, tempfile, threading, time
+from urllib.parse import unquote
 import numpy as np, cv2, matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -51,29 +52,44 @@ def angle_from_y(y, p):
     return math.degrees(math.acos(max(-1.0, min(1.0, v))))
 
 
-def annotate(frame, res, p, s):
-    out = frame.copy()
-    W, H = s['orig_w'], s['orig_h']
-    for y, col in ((p.get('y_top'), (255, 0, 0)), (p.get('y_bottom'), (255, 0, 0))):
-        if y is not None: cv2.line(out, (0, y), (W, y), col, 2)
-    for x, col in ((p.get('x_left'), (0, 255, 0)), (p.get('x_right'), (0, 255, 0))):
-        if x is not None: cv2.line(out, (x, 0), (x, H), col, 2)
+def fit_display(frame, max_w=DISPLAY_MAX_W):
+    """Return (picture no wider than max_w, scale vs. the original). Always a NEW array,
+    because decoded frames are shared with the frame cache and must never be drawn on."""
+    h, w = frame.shape[:2]
+    if w > max_w:
+        sc = max_w / float(w)
+        return cv2.resize(frame, (max_w, max(1, int(h * sc))), interpolation=cv2.INTER_AREA), sc
+    return frame.copy(), 1.0
+
+
+def draw_overlay(out, res, p, s):
+    """Draw boundary lines / detection box / state text IN PLACE on `out`, which is `s` times
+    the size of the original frame (boundaries and detections are in original coordinates).
+    Drawing after down-scaling is ~5x cheaper than drawing on the full frame."""
+    H, W = out.shape[:2]
+    th = max(1, int(round(2 * s)))
+    sc = lambda v: int(round(v * s))
+    for y in (p.get('y_top'), p.get('y_bottom')):
+        if y is not None: cv2.line(out, (0, sc(y)), (W, sc(y)), (255, 0, 0), th)
+    for x in (p.get('x_left'), p.get('x_right')):
+        if x is not None: cv2.line(out, (sc(x), 0), (sc(x), H), (0, 255, 0), th)
     if res['found']:
         x, y, w, h = res['rect']
-        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        cv2.rectangle(out, (sc(x), sc(y)), (sc(x + w), sc(y + h)), (0, 0, 255), th)
         txt, col = f"STATE: {res['state'].upper()} | Y: {int(res['y'])}", (0, 255, 255)
     else:
         txt, col = "Tape HIDDEN (back side)", (0, 0, 255)
-    cv2.putText(out, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2)
+    fs = max(0.5, 0.9 * s)
+    cv2.putText(out, txt, (8, int(10 + 22 * fs)), cv2.FONT_HERSHEY_SIMPLEX, fs, col, max(1, th))
     return out
 
 
-def encode_jpeg(bgr, max_w=DISPLAY_MAX_W):
+def encode_jpeg(bgr, max_w=DISPLAY_MAX_W, quality=80):
     h, w = bgr.shape[:2]
     if w > max_w:
         bgr = cv2.resize(bgr, (max_w, int(h * max_w / w)), interpolation=cv2.INTER_AREA)
     return 'data:image/jpeg;base64,' + base64.b64encode(
-        cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])[1]).decode()
+        cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])[1]).decode()
 
 
 def extract_params(d):
@@ -87,16 +103,84 @@ def extract_params(d):
     }
 
 
-def grab_frames(path, indices):
-    """Open video, seek to each index, return list of (idx, frame)."""
-    cap = cv2.VideoCapture(path)
-    out = []
-    for i in indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-        ret, f = cap.read()
-        if ret: out.append((i, f))
-    cap.release()
-    return out
+# ---------- Video storage / frame access ----------
+# Every uploaded video lives in ONE folder inside the app cache. Only the video that is currently
+# loaded is kept; everything else is deleted on upload, on app start and when the app is closed.
+VIDEO_DIR = os.path.join(tempfile.gettempdir(), 'wheeltracker_videos')
+_LEGACY_NAME = re.compile(r'^[0-9a-f]{32}_')   # old versions wrote <sid>_<name> straight into the temp dir
+
+
+def _rm(path):
+    try: os.remove(path)
+    except OSError: pass
+
+
+def startup_cleanup():
+    """Delete every video left behind by earlier runs (this layout and the old one)."""
+    os.makedirs(VIDEO_DIR, exist_ok=True)
+    for d in (VIDEO_DIR, tempfile.gettempdir()):
+        try: names = os.listdir(d)
+        except OSError: continue
+        for n in names:
+            if d == VIDEO_DIR or _LEGACY_NAME.match(n): _rm(os.path.join(d, n))
+
+
+def drop_session(sid):
+    s = SESSIONS.pop(sid, None)
+    if s:
+        try: s['src'].close()
+        except Exception: pass
+        _rm(s['video_path'])
+
+
+def drop_all():
+    for sid in list(SESSIONS): drop_session(sid)
+    startup_cleanup()
+
+
+class FrameSource:
+    """One persistent decoder per video (opening a decoder for every request is very slow on
+    Android) plus a tiny LRU of decoded frames, so re-rendering the same frame after a threshold /
+    boundary change costs no decoding at all. Cached frames are shared: never modify them."""
+
+    def __init__(self, path, keep=2):
+        self.path, self.keep = path, keep
+        self.lock = threading.Lock()
+        self.cap, self.cache = None, collections.OrderedDict()
+
+    def _open(self):
+        if self.cap is None: self.cap = cv2.VideoCapture(self.path)
+        return self.cap
+
+    def info(self):
+        """(fps, frame_count) or None if the video cannot be opened."""
+        with self.lock:
+            c = self._open()
+            if not c.isOpened(): return None
+            return c.get(cv2.CAP_PROP_FPS), int(c.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    def get(self, idx, cache=True):
+        with self.lock:
+            fr = self.cache.get(idx)
+            if fr is not None:
+                self.cache.move_to_end(idx)
+                return fr
+            c = self._open()
+            c.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, fr = c.read()
+            if not ok: return None
+            if cache:
+                self.cache[idx] = fr
+                while len(self.cache) > self.keep: self.cache.popitem(last=False)
+            return fr
+
+    def close(self):
+        with self.lock:
+            self.cache.clear()
+            if self.cap is not None:
+                try: self.cap.release()
+                except Exception: pass
+                self.cap = None
 
 
 _K5 = np.ones((5, 5), np.uint8)
@@ -141,30 +225,6 @@ def detect_gray(gray, x0, y0, p):
     state = 'top' if ny < 0.33 else ('mid' if ny < 0.66 else 'bottom')
     res.update(found=True, y=ch['cy'], state=state, area=ch['area'], rect=ch['rect'])
     return res
-
-
-def process_frame_roi(frame, p):
-    """Same result as process_frame() but only touches the ROI (much faster)."""
-    rect = roi_rect(p, frame.shape[1], frame.shape[0])
-    if rect is None: return _empty_res()
-    x0, y0, x1, y1 = rect
-    return detect_gray(cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY), x0, y0, p)
-
-
-def _reader(cap, n, q, stop):
-    """Decode frames on a separate thread so decoding and analysis overlap."""
-    try:
-        for _ in range(n):
-            if stop.is_set(): return
-            ret, fr = cap.read()
-            if not ret: break
-            while not stop.is_set():
-                try: q.put(fr, timeout=0.2); break
-                except queue.Full: pass
-    finally:
-        while not stop.is_set():
-            try: q.put(None, timeout=0.2); break
-            except queue.Full: pass
 
 
 # ---------- Analysis stream ----------
@@ -260,52 +320,70 @@ def _frame_range(sess, t0, t1):
 
 
 def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None):
-    """Frame-by-frame analysis with optional live preview (needs full colour frames)."""
+    """Sequential analysis with an optional live preview. It uses the SAME fast reader as the
+    parallel mode (RANGE_READER: only the tracking box is decoded); the preview picture comes
+    from the reader itself, so it costs no extra decoding."""
     fps, total, sf, ef = _frame_range(sess, t0, t1)
-    cap = cv2.VideoCapture(sess['video_path'])
-    if sf: cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
-    q, stop = queue.Queue(maxsize=24), threading.Event()
-    rd = threading.Thread(target=_reader, args=(cap, max(0, ef - sf), q, stop), daemon=True)
-    rd.start()
-    t_start, last_prev = time.time(), 0.0
+    rect = roi_rect(p, sess['orig_w'], sess['orig_h'])
+    if rect is None:
+        yield {'error': 'Tracking box is empty or outside the frame.'}; return
+    n_total = ef - sf
+    if n_total <= 0:
+        yield {'error': 'Nothing to analyse (empty time range).'}; return
     ctr = RotationCounter(p, fps)
-    fi, proc = sf, 0
+    pe = max(1, int(every)) if live else 0
+    st = {'proc': 0, 'next': sf}
+    notes = []
+    t_start = time.time()
+
+    def consume(reader):
+        for i, g, pv in reader:
+            res = detect_gray(g, rect[0], rect[1], p)
+            th = ctr.step(i, res)
+            st['proc'] += 1; st['next'] = i + 1
+            if pv is not None:
+                img, sc = pv
+                out = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) if img.ndim == 2 else img.copy()
+                draw_overlay(out, res, p, sc)
+                yield {'preview': {'frame': i, 'time_s': round(i / fps if fps > 0 else 0.0, 5),
+                                   'image': encode_jpeg(out, quality=75), 'state': res['state'],
+                                   'found': res['found'], 'angle': th, 'rotation_count': ctr.rot,
+                                   'total_frames': n_total, 'start_frame': sf}}
+
     try:
-        while fi < ef:
-            frame = q.get()
-            if frame is None: break
-            res = process_frame_roi(frame, p)
-            th = ctr.step(fi, res)
-            now = time.time()
-            if live and proc % every == 0 and now - last_prev > 0.35:
-                last_prev = now
-                yield {'preview': {'frame': fi, 'time_s': round(fi / fps if fps > 0 else 0.0, 5),
-                                   'image': encode_jpeg(annotate(frame, res, p, sess)),
-                                   'state': res['state'], 'found': res['found'], 'angle': th,
-                                   'rotation_count': ctr.rot, 'total_frames': ef - sf,
-                                   'start_frame': sf}}
-            fi += 1; proc += 1
-    finally:
-        stop.set()
-        rd.join(timeout=2)
-        cap.release()
+        yield from consume(RANGE_READER(sess, sf, ef, rect, pe))
+    except Exception as e:
+        if RANGE_READER is cv_range_reader: raise
+        notes.append(f"Fast decoder failed ({e}); finished with the slow fallback")
+        yield from consume(cv_range_reader(sess, st['next'], ef, rect, pe))
+    proc = st['proc']
+    if not proc:
+        yield {'error': 'No frames could be decoded.'}; return
     dt = max(1e-6, time.time() - t_start)
+    extra = [f"Processing time: {dt:.2f} s ({proc / dt:.0f} frames/s)"]
+    if proc < n_total: extra.append(f"Warning: decoded {proc} of {n_total} frames")
+    extra += notes
     print(f"ANALYSIS: {proc} frames in {dt:.1f}s ({proc / dt:.0f} fps)")
-    yield finish_event(ctr, proc, sf, ef, total, fps)
+    yield finish_event(ctr, proc, sf, ef, total, fps, extra)
 
 
 # ---- Fast / parallel analysis: read only the ROI, split the video into parts ----
-def cv_range_reader(sess, sf, ef, rect):
-    """Generic reader: yields (frame_index, gray ROI). Android replaces RANGE_READER with
-    a hardware-decoder version (see main.py)."""
+def cv_range_reader(sess, sf, ef, rect, preview_every=0):
+    """Generic reader: yields (frame_index, gray ROI, preview) where preview is None or
+    (picture, scale). Android replaces RANGE_READER with a hardware-decoder version (main.py)."""
     x0, y0, x1, y1 = rect
     cap = cv2.VideoCapture(sess['video_path'])
     try:
         if sf: cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
+        last_pv = 0.0
         for i in range(sf, ef):
             ok, fr = cap.read()
             if not ok: break
-            yield i, cv2.cvtColor(fr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+            pv = None
+            if preview_every and (i - sf) % preview_every == 0 and time.time() - last_pv >= 0.3:
+                last_pv = time.time()
+                pv = fit_display(fr, 640)
+            yield i, cv2.cvtColor(fr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY), pv
     finally:
         cap.release()
 
@@ -333,7 +411,7 @@ def run_parallel_stream(sess, p, parts=2, t0=None, t1=None):
 
     def consume(k, reader):
         out = results[k]
-        for i, g in reader:
+        for i, g, _pv in reader:
             if stop.is_set(): return
             r = detect_gray(g, rect[0], rect[1], p)
             out.append((i, r['found'], r['y'], r['state']))
@@ -390,21 +468,36 @@ def index(): return TEMPLATE
 
 @app.route('/upload', methods=['POST'])
 def upload():
-    f = request.files.get('video')
-    if not f or not f.filename: return jsonify({'error': 'no file'}), 400
+    """The page posts the raw file body (X-Filename header) which is streamed straight to disk:
+    no multipart parsing and no second temporary copy of the video."""
+    os.makedirs(VIDEO_DIR, exist_ok=True)
     sid = uuid.uuid4().hex
-    name = os.path.basename(f.filename)
-    tmp = os.path.join(tempfile.gettempdir(), f"{sid}_{name}")
-    f.save(tmp)
-    cap = cv2.VideoCapture(tmp)
-    if not cap.isOpened(): return jsonify({'error': 'cannot open video'}), 400
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    if fps <= 0: fps = 30.0
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    ret, frame = cap.read(); cap.release()
-    if not ret: return jsonify({'error': 'cannot read first frame'}), 400
+    if request.mimetype == 'multipart/form-data':          # legacy form upload
+        f = request.files.get('video')
+        if not f or not f.filename: return jsonify({'error': 'no file'}), 400
+        name = os.path.basename(f.filename)
+        tmp = os.path.join(VIDEO_DIR, f"{sid}_{name}")
+        f.save(tmp)
+    else:
+        name = os.path.basename(unquote(request.headers.get('X-Filename', 'video.mp4'))) or 'video.mp4'
+        safe = re.sub(r'[^A-Za-z0-9._-]', '_', name)[-80:]
+        tmp = os.path.join(VIDEO_DIR, f"{sid}_{safe}")
+        with open(tmp, 'wb') as out:
+            shutil.copyfileobj(request.stream, out, 1 << 20)
+    src = FrameSource(tmp)
+    inf = src.info()
+    if inf is None:
+        src.close(); _rm(tmp)
+        return jsonify({'error': 'cannot open video'}), 400
+    fps, total = inf
+    if not fps or fps <= 0: fps = 30.0
+    frame = src.get(0, cache=False)
+    if frame is None:
+        src.close(); _rm(tmp)
+        return jsonify({'error': 'cannot read first frame'}), 400
     h, w = frame.shape[:2]
-    SESSIONS[sid] = {'video_path': tmp, 'fps': fps, 'total_frames': total,
+    for old in list(SESSIONS): drop_session(old)        # keep only the video that is loaded now
+    SESSIONS[sid] = {'video_path': tmp, 'fps': fps, 'total_frames': total, 'src': src,
                      'orig_w': w, 'orig_h': h, 'filename': name}
     return jsonify({'sid': sid, 'fps': fps, 'total_frames': total,
                     'orig_w': w, 'orig_h': h, 'filename': name,
@@ -413,21 +506,31 @@ def upload():
 
 @app.route('/render', methods=['POST'])
 def render():
+    t0 = time.time()
     d = request.get_json(force=True)
     sess = SESSIONS.get(d.get('sid'))
     if not sess: return jsonify({'error': 'invalid session'}), 400
     idx = max(0, min(int(d.get('frame_idx', 0)), sess['total_frames'] - 1))
-    cap = cv2.VideoCapture(sess['video_path'])
-    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-    ret, frame = cap.read(); cap.release()
-    if not ret: return jsonify({'error': 'cannot read frame'}), 400
+    frame = sess['src'].get(idx)
+    if frame is None: return jsonify({'error': 'cannot read frame'}), 400
+    t1 = time.time()
     p = extract_params(d)
-    res = process_frame(frame, p)
-    disp = cv2.cvtColor(res['mask'], cv2.COLOR_GRAY2BGR) if d.get('show_mask') \
-           else annotate(frame, res, p, sess)
+    if d.get('show_mask'):
+        res = process_frame(frame, p)                       # full-frame mask, only when asked for
+        disp = cv2.cvtColor(res['mask'], cv2.COLOR_GRAY2BGR)
+        disp, sc = fit_display(disp)
+    else:
+        rect = roi_rect(p, frame.shape[1], frame.shape[0])
+        if rect is None: res = _empty_res()
+        else:
+            x0, y0, x1, y1 = rect                            # detect inside the tracking box only
+            res = detect_gray(cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY), x0, y0, p)
+        disp, sc = fit_display(frame)
+        draw_overlay(disp, res, p, sc)
     th = angle_from_y(res['y'], p) if res['found'] else None
-    return jsonify({'image': encode_jpeg(disp), 'state': res['state'],
-                    'found': res['found'], 'angle': th})
+    out = {'image': encode_jpeg(disp), 'state': res['state'], 'found': res['found'], 'angle': th}
+    print(f"RENDER frame {idx}: decode {1000 * (t1 - t0):.0f} ms, rest {1000 * (time.time() - t1):.0f} ms")
+    return jsonify(out)
 
 
 @app.route('/crop_strip', methods=['POST'])
@@ -447,7 +550,9 @@ def crop_strip():
     idxs = [max(0, min(int(s_idx + (e_idx - s_idx) * i / (n - 1)), total - 1))
             for i in range(n)]
     thumbs = []
-    for i, fr in grab_frames(sess['video_path'], idxs):
+    for i in idxs:
+        fr = sess['src'].get(i, cache=False)
+        if fr is None: continue
         h, w = fr.shape[:2]
         th = cv2.resize(fr, (130, int(h * 130 / w)), interpolation=cv2.INTER_AREA)
         thumbs.append({'time_s': round(i / fps if fps else 0, 3), 'frame': i,
@@ -669,7 +774,7 @@ progress::-moz-progress-bar{background:#4299e1}
     <div class="panel">
       <h3>Run Analysis <span id="liveBadge" class="badge live-badge">LIVE</span></h3>
       <div class="row"><input type="checkbox" id="livePreview" checked>
-        <label for="livePreview">Show live frame-by-frame preview (slower)</label></div>
+        <label for="livePreview">Show live frame preview</label></div>
       <div class="row"><label style="flex:1">Preview every N frames</label>
         <input type="number" id="previewEvery" value="3" min="1" max="60" style="width:70px"></div>
       <div class="row">
@@ -847,10 +952,14 @@ function getParams() {
 async function uploadVideo() {
   const file = $('videoFile').files[0];
   if (!file) return alert('Select a video file first.');
-  const fd = new FormData(); fd.append('video', file);
-  $('fileLabel').textContent = 'Uploading...';
-  const data = await (await fetch('/upload', {method:'POST', body:fd})).json();
-  if (data.error) return alert(data.error);
+  $('fileLabel').textContent = 'Loading...';
+  let data;
+  try {
+    data = await (await fetch('/upload', {method:'POST', body:file, headers:{
+      'Content-Type': 'application/octet-stream',
+      'X-Filename': encodeURIComponent(file.name)}})).json();
+  } catch (e) { $('fileLabel').textContent = 'Upload failed'; return alert('Upload failed: ' + e.message); }
+  if (data.error) { $('fileLabel').textContent = 'No video loaded'; return alert(data.error); }
   Object.assign(S, {sid: data.sid, fps: data.fps,
     totalFrames: data.total_frames, origW: data.orig_w, origH: data.orig_h,
     duration: data.duration || data.total_frames / data.fps,
@@ -862,7 +971,13 @@ async function uploadVideo() {
   $('cropDuration').textContent = `Duration: ${S.duration.toFixed(2)} s @ ${S.fps.toFixed(2)} fps`;
   const sl = $('frameSlider');
   sl.max = Math.max(0, data.total_frames - 1); sl.value = 0; sl.disabled = false;
-  sl.oninput = () => { if (!S.analyzing) { S.currentFrame = +sl.value; renderFrame(); } };
+  sl.oninput = () => {
+    if (S.analyzing) return;
+    S.currentFrame = +sl.value;
+    $('frameInfo').textContent =
+      `Frame: ${S.currentFrame} / ${S.totalFrames}   Time: ${(S.currentFrame / S.fps).toFixed(2)}s`;
+    renderFrame();
+  };
   $('lblCount').textContent = '0';
   $('summary').textContent = 'Run an analysis to see results here.';
   $('plot').style.display = 'none';
@@ -874,16 +989,31 @@ async function uploadVideo() {
 }
 
 // ---- Render ----
+// Only ONE /render request is in flight at a time. While the slider is dragged, further calls just
+// mark the request as dirty and the newest position is rendered when the current one returns, so
+// the server never builds a queue of frames nobody will look at.
+let _rBusy = false, _rDirty = false;
 async function renderFrame() {
   if (!S.sid || S.analyzing) return;
-  const data = await postJSON('/render', getParams());
-  if (data.error) return console.warn(data.error);
-  $('frameImg').src = data.image;
-  $('frameInfo').textContent =
-    `Frame: ${S.currentFrame} / ${S.totalFrames}   Time: ${(S.currentFrame / S.fps).toFixed(2)}s`;
-  $('lblState').textContent = data.found ? data.state.toUpperCase() : 'HIDDEN';
-  $('lblAngle').textContent = (data.found && data.angle != null)
-    ? data.angle.toFixed(1) + ' deg' : '-';
+  if (_rBusy) { _rDirty = true; return; }
+  _rBusy = true;
+  try {
+    do {
+      _rDirty = false;
+      const p = getParams();
+      let data;
+      try { data = await postJSON('/render', p); }
+      catch (e) { console.warn('render failed', e); continue; }
+      if (S.analyzing) break;
+      if (data.error) { console.warn(data.error); continue; }
+      $('frameImg').src = data.image;
+      $('frameInfo').textContent =
+        `Frame: ${p.frame_idx} / ${S.totalFrames}   Time: ${(p.frame_idx / S.fps).toFixed(2)}s`;
+      $('lblState').textContent = data.found ? data.state.toUpperCase() : 'HIDDEN';
+      $('lblAngle').textContent = (data.found && data.angle != null)
+        ? data.angle.toFixed(1) + ' deg' : '-';
+    } while (_rDirty);
+  } finally { _rBusy = false; }
 }
 
 // ---- ROI ----
@@ -901,8 +1031,8 @@ function setPickMode(mode) {
 $('frameImg').addEventListener('click', e => {
   if (!S.pickMode || !S.sid || S.analyzing) return;
   const r = e.target.getBoundingClientRect();
-  const x = Math.round((e.clientX - r.left) * e.target.naturalWidth / r.width);
-  const y = Math.round((e.clientY - r.top) * e.target.naturalHeight / r.height);
+  const x = Math.round((e.clientX - r.left) * (S.origW || e.target.naturalWidth) / r.width);
+  const y = Math.round((e.clientY - r.top) * (S.origH || e.target.naturalHeight) / r.height);
   if (S.pickMode === 'top') S.y_top = y;
   else if (S.pickMode === 'bottom') S.y_bottom = y;
   else if (S.pickMode === 'left') S.x_left = x;
@@ -1062,6 +1192,7 @@ async function runAnalysis() {
         if (!raw.startsWith('data:')) continue;
         let ev; try { ev = JSON.parse(raw.slice(5).trim()); } catch { continue; }
         if (ev.error) return alert(ev.error);
+        if (ev.progress !== undefined) $('progress').value = Math.max(2, ev.progress * 95);
         if (ev.preview) {
           const q = ev.preview;
           $('frameImg').src = q.image;

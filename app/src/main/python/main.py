@@ -1,9 +1,11 @@
 """
 Android entry point. Keeps app.py (the Flask app) almost untouched and patches it at runtime:
  1. cv2.VideoCapture is replaced by a look-alike backed by Android's MediaMetadataRetriever.
-    No conversion / transcoding step: loading a video is instant.
- 2. Fast analysis uses the phone's hardware video decoder (FastDecoder.kt) and reads only the
-    tracking box (luma plane), instead of decoding whole colour frames.
+    No conversion / transcoding step: loading a video is instant. Used for single frames only
+    (slider, thumbnails); app.py keeps ONE retriever open per video instead of one per request.
+ 2. ALL analysis (normal, live preview and parallel) uses the phone's hardware video decoder
+    (FastDecoder.kt) and reads only the tracking box (luma plane); the live preview picture is a
+    down-scaled luma frame taken from the same decoder pass, so it costs no extra decoding.
  3. Mobile-friendly CSS / viewport, and CSV export through the native bridge.
 """
 import os, tempfile, time
@@ -24,6 +26,7 @@ class JavaCap:
         try:
             from java import jclass
             self._MMR = jclass("android.media.MediaMetadataRetriever")
+            self._BB = jclass("java.nio.ByteBuffer")
             self._BAOS = jclass("java.io.ByteArrayOutputStream")
             self._CF = jclass("android.graphics.Bitmap$CompressFormat")
             self.r = self._MMR()
@@ -61,6 +64,27 @@ class JavaCap:
             return True
         return False
 
+    def _to_bgr(self, bmp):
+        """Bitmap -> BGR numpy array. Copies the raw pixels (no JPEG encode + decode round trip,
+        which used to cost more than the frame grab itself); JPEG is only a fallback."""
+        try:
+            if str(bmp.getConfig()) == "ARGB_8888":
+                from java import jarray, jbyte
+                w, h, rb = bmp.getWidth(), bmp.getHeight(), bmp.getRowBytes()
+                arr = jarray(jbyte)(rb * h)
+                bmp.copyPixelsToBuffer(self._BB.wrap(arr))
+                try:
+                    a = np.frombuffer(arr, np.uint8)
+                except Exception:
+                    a = np.frombuffer(bytes(arr), np.uint8)
+                return cv2.cvtColor(a.reshape(h, rb)[:, :w * 4].reshape(h, w, 4), cv2.COLOR_RGBA2BGR)
+        except Exception as e:
+            print("JavaCap raw copy failed, using JPEG:", e)
+        baos = self._BAOS()
+        bmp.compress(self._CF.JPEG, 92, baos)
+        buf = np.frombuffer(bytes(baos.toByteArray()), np.uint8)
+        return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
     def read(self):
         if not self.ok or self.pos >= self.total:
             return False, None
@@ -73,11 +97,10 @@ class JavaCap:
             self.pos += 1
             if bmp is None:
                 return False, None
-            baos = self._BAOS()
-            bmp.compress(self._CF.JPEG, 92, baos)
-            bmp.recycle()
-            buf = np.frombuffer(bytes(baos.toByteArray()), np.uint8)
-            frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            try:
+                frame = self._to_bgr(bmp)
+            finally:
+                bmp.recycle()
             return (frame is not None), frame
         except Exception as e:
             print("JavaCap read failed:", e)
@@ -113,8 +136,9 @@ def _to_np(jarr):
         return np.array(jarr, dtype=np.int8).view(np.uint8)  # slow but always works
 
 
-def _to_gray(f):
-    a = _to_np(f.data).reshape(f.h, f.w)
+def _to_gray(f, data=None, w=None, h=None):
+    a = _to_np(f.data if data is None else data).reshape(f.h if h is None else h,
+                                                          f.w if w is None else w)
     if not f.full:                      # limited-range luma (16..235) -> full 0..255
         a = cv2.LUT(a, _LIMITED_LUT)
     k = (4 - int(f.rotation) // 90) % 4  # raw frame -> displayed orientation
@@ -123,13 +147,17 @@ def _to_gray(f):
     return a
 
 
-def hw_range_reader(sess, sf, ef, rect):
-    """Yield (frame_index, gray ROI) for frames [sf, ef) using MediaCodec."""
+PREVIEW_MS = 300        # the decoder makes at most one preview picture per this many ms
+
+
+def hw_range_reader(sess, sf, ef, rect, preview_every=0):
+    """Yield (frame_index, gray ROI, preview) for frames [sf, ef) using MediaCodec.
+    preview is None, or (down-scaled gray full frame, scale vs. the original frame)."""
     from java import jclass
     FD = jclass("com.example.wheeltracker.FastDecoder")
     x0, y0, x1, y1 = rect
     s = FD.open(sess['video_path'], int(sf), int(ef), float(sess['fps']),
-                int(x0), int(y0), int(x1), int(y1))
+                int(x0), int(y0), int(x1), int(y1), int(preview_every), int(PREVIEW_MS))
     n = 0
     try:
         while True:
@@ -140,7 +168,11 @@ def hw_range_reader(sess, sf, ef, rect):
                 time.sleep(0.001)
                 continue
             n += 1
-            yield int(f.idx), _to_gray(f)
+            pv = None
+            if f.pdata is not None:
+                img = _to_gray(f, f.pdata, f.pw, f.ph)
+                pv = (img, img.shape[1] / float(sess['orig_w'] or img.shape[1]))
+            yield int(f.idx), _to_gray(f), pv
         err = s.errorMessage()
         if err:
             raise RuntimeError(err)
@@ -162,8 +194,18 @@ button{min-height:40px}
 """
 
 
+def cleanup():
+    """Called from MainActivity when the app is closed: delete the cached video copies."""
+    try:
+        import app as wt
+        wt.drop_all()
+    except Exception as e:
+        print("cleanup failed:", e)
+
+
 def start():
     import app as wt
+    wt.startup_cleanup()            # also removes videos left by older versions / crashed runs
     wt.RANGE_READER = hw_range_reader
     t = wt.TEMPLATE
     t = t.replace('<meta charset="utf-8">',
