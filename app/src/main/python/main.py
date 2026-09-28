@@ -102,21 +102,52 @@ def _transcode(path):
     return None
 
 
+def _frames_differ(a, b):
+    if a is None or b is None or a.shape != b.shape:
+        return True
+    # Downscale-free cheap check: mean absolute difference on a subsample.
+    diff = cv2.absdiff(a[::4, ::4], b[::4, ::4])
+    return float(diff.mean()) > 1.0
+
+
 def _try_open(path):
+    """Open with OpenCV and verify SEEKING actually works, not just reading frame 0.
+    Some Android OpenCV builds decode frame 0 fine but silently ignore
+    CAP_PROP_POS_FRAMES, which makes every later /render call return the same
+    (or no) frame. Reject that backend here so the caller falls through to
+    FFmpeg / MediaMetadataRetriever instead."""
     c = _orig_vc(path)
     try:
-        if c.isOpened():
-            ok, _ = c.read()
-            if ok:
-                c.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                return c
-    except Exception:
-        pass
-    try:
-        c.release()
-    except Exception:
-        pass
-    return None
+        if not c.isOpened():
+            raise RuntimeError("not opened")
+        ok0, frame0 = c.read()
+        if not ok0:
+            raise RuntimeError("cannot read frame 0")
+
+        total = int(c.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total <= 1:
+            # Can't verify seeking on a 1-frame clip; accept as-is.
+            c.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            return c
+
+        target = min(total - 1, max(1, total // 2))
+        seek_ok = c.set(cv2.CAP_PROP_POS_FRAMES, target)
+        ok1, frame1 = c.read()
+        actual_pos = int(c.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+
+        works = bool(seek_ok) and ok1 and (actual_pos > 1) and _frames_differ(frame0, frame1)
+        if not works:
+            raise RuntimeError(f"seek not honored (asked {target}, landed {actual_pos})")
+
+        c.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        return c
+    except Exception as e:
+        print("OpenCV backend rejected:", e)
+        try:
+            c.release()
+        except Exception:
+            pass
+        return None
 
 
 def _video_capture(path, *a):
