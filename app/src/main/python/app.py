@@ -1,5 +1,5 @@
 """
-Edge-On Wheel Rotation Counter — Flask Web Edition
+EP LAB - Flywheel — Flask Web Edition
 """
 import os, io, re, csv, math, base64, uuid, shutil, collections, json as _json, tempfile, threading, time
 from urllib.parse import unquote
@@ -272,13 +272,10 @@ class RotationCounter:
 
 
 def finish_event(ctr, proc, sf, ef, total, fps, extra=()):
-    rot, rtimes, hist, max_jump = ctr.rot, ctr.rtimes, ctr.hist, ctr.max_jump
+    rot, rtimes, hist = ctr.rot, ctr.rtimes, ctr.hist
     total_time = proc / fps if fps > 0 else 0.0
-    L = ["Analysis completed.", f"Frames processed: {proc}",
-         f"Video duration processed: {total_time:.2f} s"]
+    L = [f"Frames processed: {proc}", f"Video duration processed: {total_time:.2f} s"]
     L += list(extra)
-    if sf or ef < total:
-        L.append(f"Time crop: {sf / fps:.2f}s to {ef / fps:.2f}s")
     L.append(f"Total full rotations counted: {rot}")
     if rot and rtimes:
         off = sf / fps if fps > 0 else 0.0
@@ -288,7 +285,6 @@ def finish_event(ctr, proc, sf, ef, total, fps, extra=()):
               f"Average angular velocity: {w:.4f} rad/s ({w * 60 / (2 * math.pi):.2f} RPM)"]
     else:
         L.append("No complete rotations were counted.")
-    if max_jump: L.append(f"Max single-frame angular jump: {max_jump:.2f} deg")
     summary = "\n".join(L)
 
     times = [h['time_s'] for h in hist if h['unwrapped_angle_deg'] is not None]
@@ -347,7 +343,7 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None):
                 draw_overlay(out, res, p, sc)
                 yield {'preview': {'frame': i, 'time_s': round(i / fps if fps > 0 else 0.0, 5),
                                    'image': encode_jpeg(out, quality=75), 'state': res['state'],
-                                   'found': res['found'], 'angle': th, 'rotation_count': ctr.rot,
+                                   'found': res['found'], 'y': res['y'] if res['found'] else None, 'rotation_count': ctr.rot,
                                    'total_frames': n_total, 'start_frame': sf}}
 
     try:
@@ -360,7 +356,7 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None):
     if not proc:
         yield {'error': 'No frames could be decoded.'}; return
     dt = max(1e-6, time.time() - t_start)
-    extra = [f"Processing time: {dt:.2f} s ({proc / dt:.0f} frames/s)"]
+    extra = ["Parallel parts: 1", f"Processing time: {dt:.2f} s ({proc / dt:.0f} frames/s)"]
     if proc < n_total: extra.append(f"Warning: decoded {proc} of {n_total} frames")
     extra += notes
     print(f"ANALYSIS: {proc} frames in {dt:.1f}s ({proc / dt:.0f} fps)")
@@ -527,8 +523,8 @@ def render():
             res = detect_gray(cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY), x0, y0, p)
         disp, sc = fit_display(frame)
         draw_overlay(disp, res, p, sc)
-    th = angle_from_y(res['y'], p) if res['found'] else None
-    out = {'image': encode_jpeg(disp), 'state': res['state'], 'found': res['found'], 'angle': th}
+    out = {'image': encode_jpeg(disp), 'state': res['state'], 'found': res['found'],
+           'y': res['y'] if res['found'] else None}
     print(f"RENDER frame {idx}: decode {1000 * (t1 - t0):.0f} ms, rest {1000 * (time.time() - t1):.0f} ms")
     return jsonify(out)
 
@@ -615,25 +611,12 @@ def fast_analyze():
                     headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
 
-@app.route('/fit_alpha', methods=['POST'])
-def fit_alpha():
-    d = request.get_json(force=True)
-    h = d.get('history', [])
-    t0, t1 = float(d.get('t0', 0.0)), float(d.get('t1', 1e9))
-    pts = [(x['time_s'], x['unwrapped_angle_deg']) for x in h
-           if x['unwrapped_angle_deg'] is not None and t0 <= x['time_s'] <= t1]
-    if len(pts) < 5:
-        return jsonify({'error': 'Not enough data in the specified range.'}), 400
-    c = np.polyfit([p[0] for p in pts], np.radians([p[1] for p in pts]), 2)
-    return jsonify({'alpha': float(2.0 * c[0])})
-
-
 # ---------- Template ----------
 TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Edge-On Reaction Wheel Tracker</title>
+<title>EP LAB - Flywheel</title>
 <style>
 *{box-sizing:border-box}
 body{margin:0;font:13px -apple-system,"Segoe UI",Roboto,sans-serif;background:#181818;color:#eee}
@@ -668,6 +651,17 @@ pre.summary{background:#111;padding:12px;border-radius:4px;font-size:12px;white-
 img.plot{width:100%;background:#fff;border-radius:4px;margin-top:10px;display:block}
 .moi-grid{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:8px 10px;align-items:center;font-size:12px;margin-bottom:8px}
 .moi-grid label{color:#aaa}
+.maths-page{max-width:1100px;margin:0 auto;padding:16px}
+.formula{font-size:20px;text-align:center;padding:14px 8px;background:#111;border-radius:6px;margin-bottom:12px;font-family:"Times New Roman",serif;overflow-x:auto;white-space:nowrap}
+.formula .frac{display:inline-block;vertical-align:middle;text-align:center;margin:0 4px}
+.formula .frac>span{display:block;padding:0 6px}
+.formula .frac>span:first-child{border-bottom:1px solid #ccc}
+.mtable-wrap{overflow-x:auto}
+table.mtable{border-collapse:collapse;width:100%;font-size:12px;min-width:560px}
+.mtable th,.mtable td{border:1px solid #3a3a3a;padding:5px 6px;text-align:center}
+.mtable th{background:#1b1b1b;color:#9aa;font-weight:600}
+.mtable input{width:100%;min-width:64px;box-sizing:border-box;text-align:center}
+.mtable td.res{color:#63b3ed;font-weight:600}
 .moi-result{font-size:15px;font-weight:600;color:#63b3ed;margin-top:10px}
 progress{width:100%;height:6px;appearance:none;border:none;border-radius:3px;background:#333}
 progress::-webkit-progress-bar{background:#333;border-radius:3px}
@@ -698,11 +692,12 @@ progress::-moz-progress-bar{background:#4299e1}
 </style>
 </head>
 <body>
-<header><h1>Edge-On Reaction Wheel Tracker</h1></header>
+<header><h1>EP LAB - Flywheel</h1></header>
 <div class="tabbar">
   <button id="tabAnalysis" class="active" onclick="showTab('analysis')">Analysis</button>
   <button id="tabCrop" onclick="showTab('crop')">Time Crop</button>
   <button id="tabFast" onclick="showTab('fast')">Parallel</button>
+  <button id="tabMaths" onclick="showTab('maths')">Maths</button>
 </div>
 
 <!-- ============ ANALYSIS PAGE ============ -->
@@ -728,7 +723,7 @@ progress::-moz-progress-bar{background:#4299e1}
       <div id="statusMsg" class="status">Set the Top, Bottom, Left, and Right boundaries of the wheel to create a tracking box.</div>
       <div class="stats">
         <div>State<span id="lblState" class="big">-</span></div>
-        <div>Angle<span id="lblAngle" class="big">-</span></div>
+        <div>Y<span id="lblY" class="big">-</span></div>
         <div>Expecting<span id="lblExpect" class="big">top</span></div>
         <div>Elapsed<span id="lblTime" class="big">0.00s</span></div>
         <div style="grid-column:span 2">Rotations<span id="lblCount" class="big">0</span></div>
@@ -792,30 +787,6 @@ progress::-moz-progress-bar{background:#4299e1}
     <pre class="summary" id="summary">Run an analysis to see results here.</pre>
     <div class="row" style="margin-top:10px"><button onclick="exportCSV()">Export CSV</button></div>
     <img id="plot" class="plot" style="display:none">
-  </div>
-  <div class="panel">
-    <h3>Moment of Inertia Calculator</h3>
-    <div class="moi-grid">
-      <label>Fit start (s)</label><input type="number" id="fitStart" value="0" step="0.01">
-      <label>Fit end (s)</label><input type="number" id="fitEnd" value="1000000" step="0.01">
-    </div>
-    <div class="row"><button onclick="fitAlpha()">Fit angular acceleration (&alpha;)</button></div>
-    <div class="moi-grid">
-      <label>&alpha; (rad/s&sup2;)</label><input type="number" id="alpha" value="0" step="0.000001">
-      <label>Method</label>
-      <select id="moiMethod">
-        <option value="falling">Falling mass: I = m r&sup2;(g/a - 1)</option>
-        <option value="torque">Known torque: I = &tau; / &alpha;</option>
-      </select>
-    </div>
-    <div class="moi-grid">
-      <label>Mass m (kg)</label><input type="number" id="mass" value="0.05" step="0.001">
-      <label>Radius r (m)</label><input type="number" id="radius" value="0.01" step="0.00001">
-      <label>g (m/s&sup2;)</label><input type="number" id="gVal" value="9.81" step="0.01">
-      <label>Torque (N&middot;m)</label><input type="number" id="torque" value="0" step="0.001" disabled>
-    </div>
-    <div class="row"><button onclick="computeMOI()">Compute Moment of Inertia</button></div>
-    <div id="moiResult" class="moi-result">I = -</div>
   </div>
 </div>
 </div>
@@ -902,6 +873,53 @@ progress::-moz-progress-bar{background:#4299e1}
 </div>
 </div>
 
+<!-- ============ MATHS PAGE ============ -->
+<div id="pageMaths" class="page">
+<div class="maths-page">
+  <div class="panel">
+    <h3>Moment of Inertia (falling load method)</h3>
+    <div class="formula">
+      I &nbsp;=&nbsp;
+      <span class="frac"><span>r &middot; g &middot; t&sup2; &middot; m</span>
+        <span>4&pi; &middot; n<sub>2</sub> &middot; (1 + n<sub>2</sub>/n<sub>1</sub>)</span></span>
+    </div>
+    <div class="row">
+      <label>Radius r (cm)</label><input type="number" id="mR" step="any" placeholder="e.g. 1.25">
+      <label>g (cm/s&sup2;)</label><input type="number" id="mG" value="981" step="any">
+    </div>
+    <div class="status">m in g, t in s, r in cm, g in cm/s&sup2; &rarr; I in g&middot;cm&sup2;. n<sub>1</sub> = revolutions before the load detaches, n<sub>2</sub> = revolutions after it detaches until rest, t = time for n<sub>2</sub> revolutions.</div>
+  </div>
+  <div class="panel">
+    <h3>Observations</h3>
+    <div class="mtable-wrap">
+    <table class="mtable">
+      <thead><tr>
+        <th>Mass of hanging load m (g)</th><th>Revolutions before detached n<sub>1</sub></th>
+        <th>Revolutions to rest after detached n<sub>2</sub></th><th>Time for n<sub>2</sub> revolutions t (s)</th>
+        <th>Calculated I (g&middot;cm&sup2;)</th><th></th>
+      </tr></thead>
+      <tbody id="mBody"></tbody>
+    </table>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button onclick="mathsAddRow()">Add row</button>
+      <button class="secondary" onclick="mathsClear()">Clear all</button>
+    </div>
+  </div>
+  <div class="panel">
+    <h3>Averages</h3>
+    <div class="mtable-wrap">
+    <table class="mtable">
+      <thead><tr><th>Mass m (g)</th><th>Readings</th><th>Average n<sub>2</sub></th>
+        <th>Average t (s)</th><th>Average I (g&middot;cm&sup2;)</th></tr></thead>
+      <tbody id="mAvgBody"></tbody>
+    </table>
+    </div>
+    <div id="mOverall" class="moi-result">Average I = -</div>
+  </div>
+</div>
+</div>
+
 <div class="summary-bar">
   <div>Crop start: <span class="val" id="barStart">0.00 s</span></div>
   <div>Crop end: <span class="val" id="barEnd">0.00 s</span></div>
@@ -921,7 +939,7 @@ const postJSON = async (url, body) => (await fetch(url, {
   body: JSON.stringify(body)})).json();
 
 function showTab(name) {
-  [['analysis','Analysis'], ['crop','Crop'], ['fast','Fast']].forEach(([n, cap]) => {
+  [['analysis','Analysis'], ['crop','Crop'], ['fast','Fast'], ['maths','Maths']].forEach(([n, cap]) => {
     $('page' + cap).classList.toggle('active', name === n);
     $('tab' + cap).classList.toggle('active', name === n);
   });
@@ -1010,8 +1028,7 @@ async function renderFrame() {
       $('frameInfo').textContent =
         `Frame: ${p.frame_idx} / ${S.totalFrames}   Time: ${(p.frame_idx / S.fps).toFixed(2)}s`;
       $('lblState').textContent = data.found ? data.state.toUpperCase() : 'HIDDEN';
-      $('lblAngle').textContent = (data.found && data.angle != null)
-        ? data.angle.toFixed(1) + ' deg' : '-';
+      $('lblY').textContent = (data.found && data.y != null) ? Math.round(data.y) + ' px' : '-';
     } while (_rDirty);
   } finally { _rBusy = false; }
 }
@@ -1197,7 +1214,7 @@ async function runAnalysis() {
           const q = ev.preview;
           $('frameImg').src = q.image;
           $('lblState').textContent = (q.state || 'hidden').toUpperCase();
-          $('lblAngle').textContent = q.angle != null ? q.angle.toFixed(1) + ' deg' : '-';
+          $('lblY').textContent = q.y != null ? Math.round(q.y) + ' px' : '-';
           $('lblCount').textContent = q.rotation_count;
           $('lblTime').textContent = q.time_s.toFixed(2) + 's';
           $('frameInfo').textContent =
@@ -1287,9 +1304,9 @@ function resetAnalysis() {
   S.history = [];
   $('summary').textContent = 'Run an analysis to see results here.';
   $('lblCount').textContent = '0'; $('lblState').textContent = '-';
-  $('lblAngle').textContent = '-'; $('lblExpect').textContent = 'top';
+  $('lblY').textContent = '-'; $('lblExpect').textContent = 'top';
   $('lblTime').textContent = '0.00s'; $('plot').style.display = 'none';
-  $('progress').value = 0; $('moiResult').textContent = 'I = -';
+  $('progress').value = 0;
   $('fastSummary').textContent = 'Run an analysis to see results here.';
   $('fastPlot').style.display = 'none'; $('fastProgress').value = 0;
   $('fastStatus').textContent = '';
@@ -1305,34 +1322,54 @@ function exportCSV() {
   a.click(); URL.revokeObjectURL(url);
 }
 
-// ---- MOI ----
-async function fitAlpha() {
-  if (!S.history.length) return alert('Run an analysis first.');
-  const data = await postJSON('/fit_alpha', {history: S.history,
-    t0: +$('fitStart').value || 0, t1: +$('fitEnd').value || 1e9});
-  if (data.error) return alert(data.error);
-  $('alpha').value = data.alpha;
+// ---- Maths page ----
+function mathsMomentOfInertia(m, n1, n2, t, r, g) {
+  const v = r * g * t * t * m / (4 * Math.PI * n2 * (1 + n2 / n1));
+  return Number.isFinite(v) ? v : null;
+}
+const mFmt = v => v === null ? '-' : (Math.abs(v) >= 1e6 || (v !== 0 && Math.abs(v) < 1e-2))
+  ? v.toExponential(4) : v.toFixed(2);
+const mNum = el => el.value === '' ? NaN : +el.value;
+
+function mathsAddRow() {
+  const tr = document.createElement('tr');
+  tr.innerHTML = '<td><input type="number" step="any"></td>'.repeat(4) +
+    '<td class="res">-</td><td><button class="secondary" title="Remove row">&times;</button></td>';
+  tr.querySelectorAll('input').forEach(i => i.oninput = mathsRecalc);
+  tr.querySelector('button').onclick = () => { tr.remove(); mathsRecalc(); };
+  $('mBody').appendChild(tr);
 }
 
-$('moiMethod').onchange = e => {
-  const tq = e.target.value === 'torque';
-  $('torque').disabled = !tq; $('mass').disabled = tq; $('gVal').disabled = tq;
-};
-
-function computeMOI() {
-  const alpha = +$('alpha').value;
-  if (!alpha) return alert('alpha is zero or missing.');
-  const r = +$('radius').value, method = $('moiMethod').value;
-  let out;
-  if (method === 'falling') {
-    const m = +$('mass').value, g = +$('gVal').value, a = r * Math.abs(alpha);
-    if (a >= g) return alert('a >= g, physically impossible.');
-    out = `I = ${(m * r * r * (g / a - 1)).toExponential(6)} kg·m²   (falling-mass; a = ${a.toFixed(5)} m/s²)`;
-  } else {
-    out = `I = ${((+$('torque').value) / Math.abs(alpha)).toExponential(6)} kg·m²   (known-torque)`;
-  }
-  $('moiResult').textContent = out;
+function mathsClear() {
+  $('mBody').innerHTML = '';
+  for (let i = 0; i < 3; i++) mathsAddRow();
+  mathsRecalc();
 }
+
+function mathsRecalc() {
+  const r = mNum($('mR')), g = mNum($('mG'));
+  const groups = new Map(), all = [];
+  $('mBody').querySelectorAll('tr').forEach(tr => {
+    const [m, n1, n2, t] = [...tr.querySelectorAll('input')].map(mNum);
+    const ok = [m, n1, n2, t, r, g].every(v => Number.isFinite(v)) && n1 !== 0 && n2 !== 0;
+    const I = ok ? mathsMomentOfInertia(m, n1, n2, t, r, g) : null;
+    tr.querySelector('.res').textContent = mFmt(I);
+    if (I === null) return;
+    all.push(I);
+    if (!groups.has(m)) groups.set(m, {n2: [], t: [], I: []});
+    const grp = groups.get(m); grp.n2.push(n2); grp.t.push(t); grp.I.push(I);
+  });
+  const avg = a => a.reduce((x, y) => x + y, 0) / a.length;
+  const rows = [...groups.entries()].sort((a, b) => a[0] - b[0]).map(([m, grp]) =>
+    `<tr><td>${m}</td><td>${grp.I.length}</td><td>${avg(grp.n2).toFixed(2)}</td>` +
+    `<td>${avg(grp.t).toFixed(3)}</td><td class="res">${mFmt(avg(grp.I))}</td></tr>`);
+  $('mAvgBody').innerHTML = rows.join('') || '<tr><td colspan="5">-</td></tr>';
+  $('mOverall').textContent = all.length
+    ? `Average I = ${mFmt(avg(all))} g\u00b7cm\u00b2  (${all.length} reading${all.length > 1 ? 's' : ''})`
+    : 'Average I = -';
+}
+$('mR').oninput = $('mG').oninput = mathsRecalc;
+mathsClear();
 
 updateCropBar();
 </script>
