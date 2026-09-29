@@ -150,14 +150,14 @@ def _to_gray(f, data=None, w=None, h=None):
 PREVIEW_MS = 300        # the decoder makes at most one preview picture per this many ms
 
 
-def hw_range_reader(sess, sf, ef, rect, preview_every=0):
+def hw_range_reader(sess, sf, ef, rect, preview_every=0, preview_ms=PREVIEW_MS):
     """Yield (frame_index, gray ROI, preview) for frames [sf, ef) using MediaCodec.
     preview is None, or (down-scaled gray full frame, scale vs. the original frame)."""
     from java import jclass
     FD = jclass("com.example.wheeltracker.FastDecoder")
     x0, y0, x1, y1 = rect
     s = FD.open(sess['video_path'], int(sf), int(ef), float(sess['fps']),
-                int(x0), int(y0), int(x1), int(y1), int(preview_every), int(PREVIEW_MS))
+                int(x0), int(y0), int(x1), int(y1), int(preview_every), int(preview_ms))
     n = 0
     try:
         while True:

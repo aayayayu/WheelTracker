@@ -1,4 +1,4 @@
-# Wheel Tracker (Android, Chaquopy)
+# Flywheel Rotation Counter (Android, Chaquopy)
 
 Runs your Flask + OpenCV app fully on-device. Nothing is uploaded anywhere.
 

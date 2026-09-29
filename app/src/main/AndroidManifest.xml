@@ -4,7 +4,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
-        android:label="Wheel Tracker"
+        android:label="Flywheel Rotation Counter"
         android:largeHeap="true"
         android:usesCleartextTraffic="true"
         android:theme="@style/AppTheme">

@@ -315,10 +315,13 @@ def _frame_range(sess, t0, t1):
     return fps, total, sf, ef
 
 
-def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None):
+def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=0):
     """Sequential analysis with an optional live preview. It uses the SAME fast reader as the
     parallel mode (RANGE_READER: only the tracking box is decoded); the preview picture comes
-    from the reader itself, so it costs no extra decoding."""
+    from the reader itself, so it costs no extra decoding.
+    fps_cap > 0 (live mode only) paces the analysis to at most that many frames per second and shows
+    EVERY processed frame, each stamped with its playback time ('at'), so the page can play the
+    preview back smoothly. fps_cap = 0: full speed with a sparse preview."""
     fps, total, sf, ef = _frame_range(sess, t0, t1)
     rect = roi_rect(p, sess['orig_w'], sess['orig_h'])
     if rect is None:
@@ -327,8 +330,11 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None):
     if n_total <= 0:
         yield {'error': 'Nothing to analyse (empty time range).'}; return
     ctr = RotationCounter(p, fps)
-    pe = max(1, int(every)) if live else 0
+    cap = float(fps_cap) if (live and fps_cap and fps_cap > 0) else 0.0
+    pe = (1 if cap else max(1, int(every))) if live else 0
+    pms = 0 if cap else 300
     st = {'proc': 0, 'next': sf}
+    clk = {'origin': None, 'begin': None}
     notes = []
     t_start = time.time()
 
@@ -337,21 +343,29 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None):
             res = detect_gray(g, rect[0], rect[1], p)
             th = ctr.step(i, res)
             st['proc'] += 1; st['next'] = i + 1
+            at = None
+            if cap:
+                now = time.perf_counter()
+                if clk['origin'] is None: clk['origin'] = clk['begin'] = now
+                due = clk['begin'] + (st['proc'] - 1) / cap
+                if due > now: time.sleep(due - now)
+                elif now - due > 0.25: clk['begin'] += now - due     # fell behind: no burst catch-up
+                at = clk['begin'] + (st['proc'] - 1) / cap - clk['origin']
             if pv is not None:
                 img, sc = pv
                 out = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) if img.ndim == 2 else img.copy()
                 draw_overlay(out, res, p, sc)
                 yield {'preview': {'frame': i, 'time_s': round(i / fps if fps > 0 else 0.0, 5),
-                                   'image': encode_jpeg(out, quality=75), 'state': res['state'],
+                                   'image': encode_jpeg(out, quality=70), 'state': res['state'], 'at': at,
                                    'found': res['found'], 'y': res['y'] if res['found'] else None, 'rotation_count': ctr.rot,
                                    'total_frames': n_total, 'start_frame': sf}}
 
     try:
-        yield from consume(RANGE_READER(sess, sf, ef, rect, pe))
+        yield from consume(RANGE_READER(sess, sf, ef, rect, pe, pms))
     except Exception as e:
         if RANGE_READER is cv_range_reader: raise
         notes.append(f"Fast decoder failed ({e}); finished with the slow fallback")
-        yield from consume(cv_range_reader(sess, st['next'], ef, rect, pe))
+        yield from consume(cv_range_reader(sess, st['next'], ef, rect, pe, pms))
     proc = st['proc']
     if not proc:
         yield {'error': 'No frames could be decoded.'}; return
@@ -364,7 +378,7 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None):
 
 
 # ---- Fast / parallel analysis: read only the ROI, split the video into parts ----
-def cv_range_reader(sess, sf, ef, rect, preview_every=0):
+def cv_range_reader(sess, sf, ef, rect, preview_every=0, preview_ms=300):
     """Generic reader: yields (frame_index, gray ROI, preview) where preview is None or
     (picture, scale). Android replaces RANGE_READER with a hardware-decoder version (main.py)."""
     x0, y0, x1, y1 = rect
@@ -376,7 +390,7 @@ def cv_range_reader(sess, sf, ef, rect, preview_every=0):
             ok, fr = cap.read()
             if not ok: break
             pv = None
-            if preview_every and (i - sf) % preview_every == 0 and time.time() - last_pv >= 0.3:
+            if preview_every and (i - sf) % preview_every == 0 and time.time() - last_pv >= preview_ms / 1000.0:
                 last_pv = time.time()
                 pv = fit_display(fr, 640)
             yield i, cv2.cvtColor(fr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY), pv
@@ -567,6 +581,8 @@ def analyze():
     if None in (p['y_top'], p['y_bottom'], p['x_left'], p['x_right']):
         return jsonify({'error': 'Set TOP, BOTTOM, LEFT, RIGHT boundaries first.'}), 400
     live, every = bool(d.get('live_preview')), max(1, int(d.get('preview_every', 3)))
+    try: fps_cap = max(0.0, min(120.0, float(d.get('fps_cap') or 0)))
+    except (TypeError, ValueError): fps_cap = 0.0
     t0 = d.get('time_start'); t1 = d.get('time_end')
     t0 = max(0.0, float(t0)) if t0 is not None else None
     t1 = max(0.0, float(t1)) if t1 is not None else None
@@ -576,7 +592,7 @@ def analyze():
     def gen():
         try:
             # Without live preview no colour frames are needed: use the fast ROI-only path.
-            it = run_analysis_stream(sess, p, live, every, t0, t1) if live \
+            it = run_analysis_stream(sess, p, live, every, t0, t1, fps_cap) if live \
                  else run_parallel_stream(sess, p, 1, t0, t1)
             for ev in it:
                 yield 'data: ' + _json.dumps(ev) + '\n\n'
@@ -770,8 +786,18 @@ progress::-moz-progress-bar{background:#4299e1}
       <h3>Run Analysis <span id="liveBadge" class="badge live-badge">LIVE</span></h3>
       <div class="row"><input type="checkbox" id="livePreview" checked>
         <label for="livePreview">Show live frame preview</label></div>
-      <div class="row"><label style="flex:1">Preview every N frames</label>
+      <div class="row"><label style="flex:1">FPS cap (smooth playback)</label>
+        <select id="fpsCap" style="width:130px">
+          <option value="0">Unlimited (fastest)</option>
+          <option value="60">60 fps</option>
+          <option value="30" selected>30 fps</option>
+          <option value="15">15 fps</option>
+          <option value="10">10 fps</option>
+          <option value="5">5 fps</option>
+        </select></div>
+      <div class="row"><label style="flex:1">Preview every N frames <span class="status">(unlimited only)</span></label>
         <input type="number" id="previewEvery" value="3" min="1" max="60" style="width:70px"></div>
+      <div class="status">With a cap, every frame is analysed and shown at that speed so you can count along; a high-fps video plays in slow motion. Choose Unlimited or untick the preview for the fastest run.</div>
       <div class="row">
         <button id="btnRun" onclick="runAnalysis()">Run Full Analysis</button>
         <button class="secondary" onclick="resetAnalysis()">Reset</button>
@@ -1174,6 +1200,49 @@ const applyCropToAnalysis = () => applyCrop('analysis');
 const applyCropToFast = () => applyCrop('fast');
 
 // ---- Analysis ----
+// ---- Live preview playback ----
+// Capped runs stamp every preview with its playback time ('at', seconds since the first frame). The page
+// keeps a small jitter buffer and shows each frame when its time comes, so playback stays even even if
+// the phone delivers the frames in bursts. Uncapped runs (sparse previews) are shown immediately.
+const Live = {q: [], base: null, raf: 0};
+function liveShow(q) {
+  $('frameImg').src = q.image;
+  $('lblState').textContent = (q.state || 'hidden').toUpperCase();
+  $('lblY').textContent = q.y != null ? Math.round(q.y) + ' px' : '-';
+  $('lblCount').textContent = q.rotation_count;
+  $('lblTime').textContent = q.time_s.toFixed(2) + 's';
+  $('frameInfo').textContent =
+    `Frame: ${q.frame} / ${q.total_frames + (q.start_frame || 0)}   Time: ${q.time_s.toFixed(2)}s`;
+  $('frameSlider').value = q.frame; S.currentFrame = q.frame;
+  const frac = q.total_frames > 0 ? (q.frame - (q.start_frame || 0)) / q.total_frames : 0;
+  $('progress').value = Math.min(95, frac * 95);
+}
+function livePush(q) {
+  if (q.at == null) return liveShow(q);
+  if (Live.base === null) Live.base = performance.now() + 250;      // 250 ms jitter buffer
+  Live.q.push(q);
+  if (!Live.raf) Live.raf = requestAnimationFrame(liveTick);
+}
+function liveTick() {
+  Live.raf = 0;
+  const t = performance.now() - Live.base;
+  let last = null;
+  while (Live.q.length && Live.q[0].at * 1000 <= t) last = Live.q.shift();
+  if (last) liveShow(last);
+  if (S.analyzing && Live.base !== null) Live.raf = requestAnimationFrame(liveTick);
+}
+function liveReset() {
+  Live.q = []; Live.base = null;
+  if (Live.raf) { cancelAnimationFrame(Live.raf); Live.raf = 0; }
+}
+function syncLiveControls() {
+  const live = $('livePreview').checked, cap = +$('fpsCap').value;
+  $('fpsCap').disabled = !live;
+  $('previewEvery').disabled = !live || cap > 0;
+}
+$('livePreview').onchange = $('fpsCap').onchange = syncLiveControls;
+syncLiveControls();
+
 async function runAnalysis() {
   if (!S.sid) return alert('Load a video first.');
   if (S.y_top === null || S.y_bottom === null || S.x_left === null || S.x_right === null)
@@ -1187,6 +1256,8 @@ async function runAnalysis() {
 
   const p = getParams();
   p.live_preview = live; p.preview_every = +$('previewEvery').value || 3;
+  p.fps_cap = live ? +$('fpsCap').value : 0;
+  liveReset();
   if (cropOn) { p.time_start = S.cropStart; p.time_end = S.cropEnd; }
 
   try {
@@ -1210,20 +1281,9 @@ async function runAnalysis() {
         let ev; try { ev = JSON.parse(raw.slice(5).trim()); } catch { continue; }
         if (ev.error) return alert(ev.error);
         if (ev.progress !== undefined) $('progress').value = Math.max(2, ev.progress * 95);
-        if (ev.preview) {
-          const q = ev.preview;
-          $('frameImg').src = q.image;
-          $('lblState').textContent = (q.state || 'hidden').toUpperCase();
-          $('lblY').textContent = q.y != null ? Math.round(q.y) + ' px' : '-';
-          $('lblCount').textContent = q.rotation_count;
-          $('lblTime').textContent = q.time_s.toFixed(2) + 's';
-          $('frameInfo').textContent =
-            `Frame: ${q.frame} / ${q.total_frames + (q.start_frame || 0)}   Time: ${q.time_s.toFixed(2)}s`;
-          $('frameSlider').value = q.frame; S.currentFrame = q.frame;
-          const frac = q.total_frames > 0 ? (q.frame - (q.start_frame || 0)) / q.total_frames : 0;
-          $('progress').value = Math.min(95, frac * 95);
-        }
+        if (ev.preview) livePush(ev.preview);
         if (ev.done) {
+          liveReset();
           S.history = ev.history || [];
           $('summary').textContent = ev.summary;
           $('lblCount').textContent = ev.rotation_count;
@@ -1235,6 +1295,7 @@ async function runAnalysis() {
   } catch (e) { alert('Analysis error: ' + e.message); }
   finally {
     S.analyzing = false; btn.disabled = false; btn.textContent = 'Run Full Analysis';
+    liveReset();
     badge.classList.remove('active');
     setTimeout(() => $('progress').value = 0, 1200);
   }
