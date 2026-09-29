@@ -14,3 +14,6 @@ Runs your Flask + OpenCV app fully on-device. Nothing is uploaded anywhere.
   request at a time. Logcat (tag `python`) prints `RENDER frame N: decode X ms` so you can see the raw decode cost.
 - Only the currently loaded video is kept in the app cache. Older copies are deleted on upload,
   on app start and when the app is closed.
+
+## Build
+The GitHub Action builds the debug APK and publishes it as `Flywheel.apk` (artifact "Flywheel").

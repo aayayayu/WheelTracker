@@ -23,6 +23,7 @@ class JavaCap:
 
     def __init__(self, path):
         self.ok, self.pos, self.total, self.fps, self.w, self.h = False, 0, 0, 30.0, 0, 0
+        self.rot = 0
         try:
             from java import jclass
             self._MMR = jclass("android.media.MediaMetadataRetriever")
@@ -35,6 +36,7 @@ class JavaCap:
             dur_ms = float(g(9) or 0)            # METADATA_KEY_DURATION
             n = g(32)                            # METADATA_KEY_VIDEO_FRAME_COUNT
             self.w, self.h = int(g(18) or 0), int(g(19) or 0)
+            self.rot = int(g(24) or 0)           # METADATA_KEY_VIDEO_ROTATION
             self.total = int(n) if n else 0
             if self.total and dur_ms > 0:
                 self.fps = self.total / (dur_ms / 1000.0)
@@ -84,6 +86,25 @@ class JavaCap:
         bmp.compress(self._CF.JPEG, 92, baos)
         buf = np.frombuffer(bytes(baos.toByteArray()), np.uint8)
         return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
+    def read_thumb(self, max_w):
+        """Small BGR picture of frame `pos`, scaled by the decoder itself (no full-size bitmap copy).
+        Returns None if that is not possible; the caller then falls back to read()."""
+        if not self.ok or not (0 <= self.pos < self.total):
+            return None
+        dw, dh = (self.h, self.w) if self.rot in (90, 270) else (self.w, self.h)   # displayed size
+        if dw <= 0 or dh <= 0:
+            return None
+        tw = min(int(max_w), dw)
+        th = max(1, int(round(dh * tw / dw)))
+        us = int(self.pos * 1_000_000 / (self.fps or 30.0))
+        bmp = self.r.getScaledFrameAtTime(us, 3, tw, th)          # 3 = OPTION_CLOSEST
+        if bmp is None:
+            return None
+        try:
+            return self._to_bgr(bmp)
+        finally:
+            bmp.recycle()
 
     def read(self):
         if not self.ok or self.pos >= self.total:

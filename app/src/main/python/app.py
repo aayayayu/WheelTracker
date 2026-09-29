@@ -62,7 +62,7 @@ def fit_display(frame, max_w=DISPLAY_MAX_W):
     return frame.copy(), 1.0
 
 
-def draw_overlay(out, res, p, s):
+def draw_overlay(out, res, p, s, rot=None):
     """Draw boundary lines / detection box / state text IN PLACE on `out`, which is `s` times
     the size of the original frame (boundaries and detections are in original coordinates).
     Drawing after down-scaling is ~5x cheaper than drawing on the full frame."""
@@ -79,8 +79,12 @@ def draw_overlay(out, res, p, s):
         txt, col = f"STATE: {res['state'].upper()} | Y: {int(res['y'])}", (0, 255, 255)
     else:
         txt, col = "Tape HIDDEN (back side)", (0, 0, 255)
-    fs = max(0.5, 0.9 * s)
-    cv2.putText(out, txt, (8, int(10 + 22 * fs)), cv2.FONT_HERSHEY_SIMPLEX, fs, col, max(1, th))
+    fs = max(0.42, 0.55 * s)                       # small text: it must not cover the wheel
+    tk = max(1, int(round(1.5 * s)))
+    lh = int(12 + 16 * fs)                         # line height
+    cv2.putText(out, txt, (8, lh), cv2.FONT_HERSHEY_SIMPLEX, fs, col, tk)
+    if rot is not None:
+        cv2.putText(out, f"Rot.: {int(rot)}", (8, 2 * lh), cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 255, 0), tk)
     return out
 
 
@@ -147,6 +151,7 @@ class FrameSource:
         self.path, self.keep = path, keep
         self.lock = threading.Lock()
         self.cap, self.cache = None, collections.OrderedDict()
+        self.thumbs = collections.OrderedDict()      # frame index -> encoded thumbnail (data URL)
 
     def _open(self):
         if self.cap is None: self.cap = cv2.VideoCapture(self.path)
@@ -174,8 +179,37 @@ class FrameSource:
                 while len(self.cache) > self.keep: self.cache.popitem(last=False)
             return fr
 
+    def thumb(self, idx, max_w=130):
+        """Small JPEG data URL of one frame. Uses the decoder's own down-scaling when it has one
+        (Android: no full-size bitmap copy per thumbnail) and remembers finished thumbnails."""
+        with self.lock:
+            t = self.thumbs.get(idx)
+            if t is not None:
+                self.thumbs.move_to_end(idx)
+                return t
+            c = self._open()
+            small = None
+            fn = getattr(c, 'read_thumb', None)
+            if fn is not None:
+                c.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                try: small = fn(max_w)
+                except Exception: small = None
+            if small is None:
+                fr = self.cache.get(idx)
+                if fr is None:
+                    c.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    ok, fr = c.read()
+                    if not ok: return None
+                h, w = fr.shape[:2]
+                small = cv2.resize(fr, (max_w, max(1, int(h * max_w / w))), interpolation=cv2.INTER_AREA)
+            t = encode_jpeg(small, max_w=max_w, quality=70)
+            self.thumbs[idx] = t
+            while len(self.thumbs) > 300: self.thumbs.popitem(last=False)
+            return t
+
     def close(self):
         with self.lock:
+            self.thumbs.clear()
             self.cache.clear()
             if self.cap is not None:
                 try: self.cap.release()
@@ -354,7 +388,7 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=
             if pv is not None:
                 img, sc = pv
                 out = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) if img.ndim == 2 else img.copy()
-                draw_overlay(out, res, p, sc)
+                draw_overlay(out, res, p, sc, ctr.rot)
                 yield {'preview': {'frame': i, 'time_s': round(i / fps if fps > 0 else 0.0, 5),
                                    'image': encode_jpeg(out, quality=70), 'state': res['state'], 'at': at,
                                    'found': res['found'], 'y': res['y'] if res['found'] else None, 'rotation_count': ctr.rot,
@@ -536,7 +570,8 @@ def render():
             x0, y0, x1, y1 = rect                            # detect inside the tracking box only
             res = detect_gray(cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY), x0, y0, p)
         disp, sc = fit_display(frame)
-        draw_overlay(disp, res, p, sc)
+        rot = d.get('rot')
+        draw_overlay(disp, res, p, sc, None if rot is None else int(rot))
     out = {'image': encode_jpeg(disp), 'state': res['state'], 'found': res['found'],
            'y': res['y'] if res['found'] else None}
     print(f"RENDER frame {idx}: decode {1000 * (t1 - t0):.0f} ms, rest {1000 * (time.time() - t1):.0f} ms")
@@ -559,16 +594,16 @@ def crop_strip():
     s_idx, e_idx = int(ws * fps), int(we * fps)
     idxs = [max(0, min(int(s_idx + (e_idx - s_idx) * i / (n - 1)), total - 1))
             for i in range(n)]
+    # The page asks for the strip in small batches (offset/count) so thumbnails appear as they finish.
+    off = max(0, int(d.get('offset', 0)))
+    cnt = max(1, int(d.get('count', n)))
+    slots = [{'slot': k, 'frame': i, 'time_s': round(i / fps if fps else 0, 3)} for k, i in enumerate(idxs)]
     thumbs = []
-    for i in idxs:
-        fr = sess['src'].get(i, cache=False)
-        if fr is None: continue
-        h, w = fr.shape[:2]
-        th = cv2.resize(fr, (130, int(h * 130 / w)), interpolation=cv2.INTER_AREA)
-        thumbs.append({'time_s': round(i / fps if fps else 0, 3), 'frame': i,
-                       'image': encode_jpeg(th, max_w=130)})
-    return jsonify({'thumbs': thumbs, 'win_start': round(ws, 3),
-                    'win_end': round(we, 3), 'center_time': round(c, 3),
+    for sl in slots[off:off + cnt]:
+        img = sess['src'].thumb(sl['frame'], 130)
+        if img is not None: thumbs.append(dict(sl, image=img))
+    return jsonify({'thumbs': thumbs, 'slots': slots, 'thumb_h': max(1, round(130 * sess['orig_h'] / sess['orig_w'])),
+                    'win_start': round(ws, 3), 'win_end': round(we, 3), 'center_time': round(c, 3),
                     'duration': round(dur, 3), 'fps': fps})
 
 
@@ -788,9 +823,9 @@ progress::-moz-progress-bar{background:#4299e1}
         <label for="livePreview">Show live frame preview</label></div>
       <div class="row"><label style="flex:1">FPS cap (smooth playback)</label>
         <select id="fpsCap" style="width:130px">
-          <option value="0">Unlimited (fastest)</option>
+          <option value="0" selected>Unlimited (fastest)</option>
           <option value="60">60 fps</option>
-          <option value="30" selected>30 fps</option>
+          <option value="30">30 fps</option>
           <option value="15">15 fps</option>
           <option value="10">10 fps</option>
           <option value="5">5 fps</option>
@@ -1036,6 +1071,14 @@ async function uploadVideo() {
 // Only ONE /render request is in flight at a time. While the slider is dragged, further calls just
 // mark the request as dirty and the newest position is rendered when the current one returns, so
 // the server never builds a queue of frames nobody will look at.
+// Rotation count at a frame, taken from the last analysis (null before any analysis / outside its range).
+function rotAtFrame(f) {
+  const h = S.history;
+  if (!h || !h.length || f < h[0].frame || f > h[h.length - 1].frame) return null;
+  let lo = 0, hi = h.length - 1;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (h[mid].frame <= f) lo = mid; else hi = mid - 1; }
+  return h[lo].rotation_count;
+}
 let _rBusy = false, _rDirty = false;
 async function renderFrame() {
   if (!S.sid || S.analyzing) return;
@@ -1045,6 +1088,8 @@ async function renderFrame() {
     do {
       _rDirty = false;
       const p = getParams();
+      const rot = rotAtFrame(p.frame_idx);
+      if (rot !== null) p.rot = rot;
       let data;
       try { data = await postJSON('/render', p); }
       catch (e) { console.warn('render failed', e); continue; }
@@ -1123,11 +1168,14 @@ function updateCropBar() {
 const loadStartWindow = () => S.sid ? fetchStrip('start', +$('startWinCenter').value || 0) : alert('Load a video first.');
 const loadEndWindow = () => S.sid ? fetchStrip('end', +$('endWinCenter').value || 0) : alert('Load a video first.');
 
+const stripTok = {start: 0, end: 0};
 async function fetchStrip(which, center) {
-  const el = $(which + 'Strip');
+  const tok = ++stripTok[which], el = $(which + 'Strip'), BATCH = 4;
   el.innerHTML = '<div class="hint" style="padding:20px">Loading…</div>';
-  const data = await postJSON('/crop_strip', {sid: S.sid, center_time: center,
-    before: STRIP_BEFORE, after: STRIP_AFTER, n: STRIP_N});
+  const ask = off => postJSON('/crop_strip', {sid: S.sid, center_time: center,
+    before: STRIP_BEFORE, after: STRIP_AFTER, n: STRIP_N, offset: off, count: BATCH});
+  const data = await ask(0);
+  if (tok !== stripTok[which]) return;                       // a newer Load replaced this one
   if (data.error) return el.innerHTML = `<div class="hint" style="padding:20px">Error: ${data.error}</div>`;
   $(which + 'WinCenter').value = data.center_time.toFixed(2);
   $(which + 'WinInfo').textContent =
@@ -1136,15 +1184,25 @@ async function fetchStrip(which, center) {
   const sl = $(which + 'Slider');
   sl.min = data.win_start; sl.max = data.win_end; sl.step = 0.01;
   el.innerHTML = ''; el.dataset.loaded = '1';
-  data.thumbs.forEach(t => {
+  // all slots appear at once (with their time labels); the pictures fill in batch by batch
+  const cells = data.slots.map(t => {
     const d = document.createElement('div');
     d.className = 'thumb'; d.dataset.time = t.time_s;
-    d.innerHTML = `<img src="${t.image}"><div class="tlabel">${t.time_s.toFixed(2)}s</div>`;
+    d.innerHTML = `<img style="width:130px;height:${data.thumb_h}px;background:#111">` +
+                  `<div class="tlabel">${t.time_s.toFixed(2)}s</div>`;
     d.onclick = () => selectTime(which, t.time_s);
     el.appendChild(d);
+    return d;
   });
+  const fill = r => r.thumbs.forEach(t => { cells[t.slot].querySelector('img').src = t.image; });
+  fill(data);
   const cur = which === 'start' ? S.startSel : S.endSel;
   selectTime(which, (cur < data.win_start || cur > data.win_end) ? data.center_time : cur, false);
+  for (let off = BATCH; off < data.slots.length; off += BATCH) {
+    const r = await ask(off);
+    if (tok !== stripTok[which]) return;
+    if (!r.error) fill(r);
+  }
 }
 
 function selectTime(which, t, skipSlider) {
