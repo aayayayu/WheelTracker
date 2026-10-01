@@ -4,6 +4,7 @@ EP LAB - Flywheel — Flask Web Edition
 import os, io, re, csv, math, base64, uuid, shutil, collections, json as _json, tempfile, threading, time
 from urllib.parse import unquote
 import numpy as np, cv2, matplotlib
+import wheel_algo as wa
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from flask import Flask, request, jsonify, Response
@@ -44,14 +45,6 @@ def process_frame(frame, p):
     return res
 
 
-def angle_from_y(y, p):
-    yt, yb = p['y_top'], p['y_bottom']
-    yc, r = (yt + yb) / 2.0, abs(yb - yt) / 2.0
-    if r == 0: return 0.0
-    v = (yc - y) / r if p['direction'] == 'down' else (y - yc) / r
-    return math.degrees(math.acos(max(-1.0, min(1.0, v))))
-
-
 def fit_display(frame, max_w=DISPLAY_MAX_W):
     """Return (picture no wider than max_w, scale vs. the original). Always a NEW array,
     because decoded frames are shared with the frame cache and must never be drawn on."""
@@ -63,7 +56,7 @@ def fit_display(frame, max_w=DISPLAY_MAX_W):
 
 
 def draw_overlay(out, res, p, s, rot=None):
-    """Draw boundary lines / detection box / state text IN PLACE on `out`, which is `s` times
+    """Draw boundary lines / wheel box / tape box / state text IN PLACE on `out`, which is `s` times
     the size of the original frame (boundaries and detections are in original coordinates).
     Drawing after down-scaling is ~5x cheaper than drawing on the full frame."""
     H, W = out.shape[:2]
@@ -73,6 +66,9 @@ def draw_overlay(out, res, p, s, rot=None):
         if y is not None: cv2.line(out, (0, sc(y)), (W, sc(y)), (255, 0, 0), th)
     for x in (p.get('x_left'), p.get('x_right')):
         if x is not None: cv2.line(out, (sc(x), 0), (sc(x), H), (0, 255, 0), th)
+    wh = res.get('wheel')
+    if wh:                                           # wheel found automatically inside the tracking box
+        cv2.rectangle(out, (sc(wh[0]), sc(wh[1])), (sc(wh[2]), sc(wh[3])), (255, 200, 0), max(1, th // 2))
     if res['found']:
         x, y, w, h = res['rect']
         cv2.rectangle(out, (sc(x), sc(y)), (sc(x + w), sc(y + h)), (0, 0, 255), th)
@@ -84,7 +80,7 @@ def draw_overlay(out, res, p, s, rot=None):
     lh = int(12 + 16 * fs)                         # line height
     cv2.putText(out, txt, (8, lh), cv2.FONT_HERSHEY_SIMPLEX, fs, col, tk)
     if rot is not None:
-        cv2.putText(out, f"Rot.: {int(rot)}", (8, 2 * lh), cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 255, 0), tk)
+        cv2.putText(out, f"Rot.: {float(rot):.2f}", (8, 2 * lh), cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 255, 0), tk)
     return out
 
 
@@ -218,11 +214,10 @@ class FrameSource:
 
 
 _K5 = np.ones((5, 5), np.uint8)
-_PAD = 6   # >= reach of the open(1x)+close(2x) 5x5 morphology
 
 
 def _empty_res():
-    return {'found': False, 'mask': None, 'y': None, 'state': 'hidden', 'area': 0, 'rect': None}
+    return {'found': False, 'mask': None, 'y': None, 'state': 'hidden', 'area': 0, 'rect': None, 'wheel': None}
 
 
 def roi_rect(p, W, H):
@@ -235,110 +230,67 @@ def roi_rect(p, W, H):
     return x0, y0, x1, y1
 
 
+def detect_rec(gray, x0, y0, p):
+    """Measure one already-cropped grayscale tracking box whose top-left corner is (x0, y0) in the
+    full frame. Returns (raw single-frame result in full-frame coordinates, light record that
+    wheel_algo.solve() needs later)."""
+    rec = wa.measure_frame(gray)
+    return wa.frame_result(rec, x0, y0, p), rec
+
+
 def detect_gray(gray, x0, y0, p):
-    """Detect the tape in an already-cropped grayscale ROI whose top-left corner is
-    (x0, y0) in the full frame. Returned y / rect are in full-frame coordinates."""
-    res = _empty_res()
-    yt, yb = p['y_top'], p['y_bottom']
-    _, m = cv2.threshold(gray, p['black_thresh'], 255, cv2.THRESH_BINARY_INV)
-    m = cv2.copyMakeBorder(m, _PAD, _PAD, _PAD, _PAD, cv2.BORDER_CONSTANT, value=0)
-    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, _K5, iterations=1)
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, _K5, iterations=2)
-    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    ox, oy = x0 - _PAD, y0 - _PAD
-    cands = []
-    for c in cnts:
-        a = cv2.contourArea(c)
-        if a < p['min_area'] or (p['max_area'] > 0 and a > p['max_area']): continue
-        x, y, w, h = cv2.boundingRect(c)
-        cands.append({'area': a, 'cy': y + h / 2.0 + oy, 'rect': (x + ox, y + oy, w, h)})
-    if not cands: return res
-    ch = max(cands, key=lambda c: c['area'])
-    span = (yb - yt) or 1
-    ny = (ch['cy'] - yt) / span
-    state = 'top' if ny < 0.33 else ('mid' if ny < 0.66 else 'bottom')
-    res.update(found=True, y=ch['cy'], state=state, area=ch['area'], rect=ch['rect'])
-    return res
+    return detect_rec(gray, x0, y0, p)[0]
 
 
 # ---------- Analysis stream ----------
-class RotationCounter:
-    """Sequential state machine (debounce + top/mid/bottom/hidden sequence).
-    Cheap, so it always runs once, in order, over per-frame detections."""
-
-    def __init__(self, p, fps):
-        self.p, self.fps = p, fps
-        self.seq = ['top', 'mid', 'bottom', 'hidden'] if p['direction'] == 'down' \
-                   else ['bottom', 'mid', 'top', 'hidden']
-        self.exp, self.cand, self.ccnt, self.stable = 0, None, 0, None
-        self.rot, self.rtimes, self.cum = 0, [], 0.0
-        self.prev, self.max_jump, self.hist = None, 0.0, []
-
-    def step(self, fi, res):
-        p, seq = self.p, self.seq
-        t = fi / self.fps if self.fps > 0 else 0.0
-        st = res['state']
-        if st == self.cand: self.ccnt += 1
-        else: self.cand, self.ccnt = st, 1
-        if self.ccnt >= p['debounce'] and st != self.stable:
-            first = self.stable is None
-            self.stable = st
-            if first:
-                if st in seq: self.exp = (seq.index(st) + 1) % 4
-            else:
-                if st == seq[self.exp]:
-                    self.exp = (self.exp + 1) % 4
-                    if self.exp == 0: self.rot += 1; self.rtimes.append(t)
-                elif not p['strict'] and st in seq:
-                    self.exp = (seq.index(st) + 1) % 4
-                    if self.exp == 0: self.rot += 1; self.rtimes.append(t)
-        th = None
-        if res['found']:
-            th = angle_from_y(res['y'], p)
-            self.cum = self.rot * 360.0 + th
-            if self.prev is not None: self.max_jump = max(self.max_jump, abs(self.cum - self.prev))
-            self.prev = self.cum
-        self.hist.append({'frame': fi, 'time_s': round(t, 5),
-                          'y_position': res['y'] if res['found'] else None,
-                          'unwrapped_angle_deg': self.cum if res['found'] else None,
-                          'state': st, 'stable_state': self.stable, 'rotation_count': self.rot})
-        return th
-
-
-def finish_event(ctr, proc, sf, ef, total, fps, extra=()):
-    rot, rtimes, hist = ctr.rot, ctr.rtimes, ctr.hist
-    total_time = proc / fps if fps > 0 else 0.0
-    L = [f"Frames processed: {proc}", f"Video duration processed: {total_time:.2f} s"]
+def finish_event(sol, frames, ox, oy, fps, p, sf, ef, total, extra=()):
+    """Build the final 'done' event from wheel_algo.solve() output. `frames` = frame index per record."""
+    n, rot, theta, tot = sol['n'], sol['rot'], sol['theta'], sol['total']
+    ks = sol['known']
+    total_time = n / fps if fps > 0 else 0.0
+    L = [f"Frames processed: {n}", f"Video duration processed: {total_time:.2f} s"]
     L += list(extra)
-    L.append(f"Total full rotations counted: {rot}")
-    if rot and rtimes:
-        off = sf / fps if fps > 0 else 0.0
-        per = (rtimes[-1] - off) / rot
+    L.append(f"Tape passes detected: {len(sol['passes'])}"
+             + (f" (ignored {sol['n_groups'] - len(sol['passes'])} short/invalid)" if sol['n_groups'] > len(sol['passes']) else ""))
+    L.append(f"Total rotations: {tot:.2f}   (full rotations: {int(math.floor(tot + 1e-9))})")
+    if ks and fps > 0 and rot[ks[-1]] - rot[ks[0]] > 0.05:
+        per = ((ks[-1] - ks[0]) / fps) / (rot[ks[-1]] - rot[ks[0]])
         w = 2 * math.pi / per
         L += [f"Average period per rotation: {per:.4f} s",
               f"Average angular velocity: {w:.4f} rad/s ({w * 60 / (2 * math.pi):.2f} RPM)"]
-    else:
-        L.append("No complete rotations were counted.")
+    elif not ks:
+        L.append("The tape was never found - check the tracking box and the Black Limit.")
     summary = "\n".join(L)
 
-    times = [h['time_s'] for h in hist if h['unwrapped_angle_deg'] is not None]
-    angs = [h['unwrapped_angle_deg'] for h in hist if h['unwrapped_angle_deg'] is not None]
-    all_t = [h['time_s'] for h in hist]
-    cnts = [h['rotation_count'] for h in hist]
+    hist = []
+    for k in range(n):
+        t = sol['tapes'][k]
+        if t is not None:
+            yc = (t[0] + t[1]) / 2.0
+            state, ypos = wa.state_of(yc, sol['top'][k], sol['bot'][k]), oy + yc
+        else:
+            state, ypos = 'hidden', None
+        hist.append({'frame': int(frames[k]), 'time_s': round(frames[k] / fps if fps > 0 else 0.0, 5),
+                     'y_position': ypos, 'unwrapped_angle_deg': round(float(theta[k] - theta[0]), 3),
+                     'state': state, 'stable_state': state, 'rotation_count': round(float(rot[k]), 3)})
 
+    times = [h['time_s'] for h in hist]
+    seen_t = [hist[i]['time_s'] for i in ks]
+    seen_a = [hist[i]['unwrapped_angle_deg'] for i in ks]
     fig, (a1, a2) = plt.subplots(2, 1, figsize=(9, 6))
-    if times: a1.plot(times, angs, '.', ms=2, color='steelblue')
+    if times: a1.plot(times, [h['unwrapped_angle_deg'] for h in hist], '-', lw=1, color='lightsteelblue')
+    if seen_t: a1.plot(seen_t, seen_a, '.', ms=3, color='steelblue')
     a1.set(xlabel="time (s)", ylabel="cumulative angle (deg)",
-           title="Unwrapped marker angle vs time"); a1.grid(alpha=0.3)
-    if all_t: a2.step(all_t, cnts, where='post', color='darkorange')
+           title="Tape angle vs time (dots = tape visible, line = interpolated)"); a1.grid(alpha=0.3)
+    if times: a2.plot(times, [h['rotation_count'] for h in hist], color='darkorange')
     a2.set(xlabel="time (s)", ylabel="rotations",
-           title="Cumulative rotation count vs time"); a2.grid(alpha=0.3)
+           title="Cumulative rotations vs time"); a2.grid(alpha=0.3)
     fig.tight_layout()
     buf = io.BytesIO(); fig.savefig(buf, format='png', dpi=90, bbox_inches='tight')
     plt.close(fig); buf.seek(0)
     plot = 'data:image/png;base64,' + base64.b64encode(buf.read()).decode()
 
-    return {'done': True, 'summary': summary, 'rotation_count': rot,
+    return {'done': True, 'summary': summary, 'rotation_count': round(tot, 2),
             'history': hist, 'plot': plot, 'start_frame': sf, 'end_frame': ef}
 
 
@@ -363,7 +315,8 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=
     n_total = ef - sf
     if n_total <= 0:
         yield {'error': 'Nothing to analyse (empty time range).'}; return
-    ctr = RotationCounter(p, fps)
+    ctr = wa.LiveEstimator(p)
+    recs = []                                   # (frame index, light record)
     cap = float(fps_cap) if (live and fps_cap and fps_cap > 0) else 0.0
     pe = (1 if cap else max(1, int(every))) if live else 0
     pms = 0 if cap else 300
@@ -374,8 +327,9 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=
 
     def consume(reader):
         for i, g, pv in reader:
-            res = detect_gray(g, rect[0], rect[1], p)
-            th = ctr.step(i, res)
+            res, rec = detect_rec(g, rect[0], rect[1], p)
+            recs.append((i, rec))
+            live_rot = ctr.step(i, res)
             st['proc'] += 1; st['next'] = i + 1
             at = None
             if cap:
@@ -388,10 +342,10 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=
             if pv is not None:
                 img, sc = pv
                 out = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) if img.ndim == 2 else img.copy()
-                draw_overlay(out, res, p, sc, ctr.rot)
+                draw_overlay(out, res, p, sc, live_rot)
                 yield {'preview': {'frame': i, 'time_s': round(i / fps if fps > 0 else 0.0, 5),
                                    'image': encode_jpeg(out, quality=70), 'state': res['state'], 'at': at,
-                                   'found': res['found'], 'y': res['y'] if res['found'] else None, 'rotation_count': ctr.rot,
+                                   'found': res['found'], 'y': res['y'] if res['found'] else None, 'rotation_count': round(live_rot, 2),
                                    'total_frames': n_total, 'start_frame': sf}}
 
     try:
@@ -408,7 +362,11 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=
     if proc < n_total: extra.append(f"Warning: decoded {proc} of {n_total} frames")
     extra += notes
     print(f"ANALYSIS: {proc} frames in {dt:.1f}s ({proc / dt:.0f} fps)")
-    yield finish_event(ctr, proc, sf, ef, total, fps, extra)
+    try:
+        sol = wa.solve([r for _, r in recs], p)
+    except RuntimeError as e:
+        yield {'error': str(e)}; return
+    yield finish_event(sol, [i for i, _ in recs], rect[0], rect[1], fps, p, sf, ef, total, extra)
 
 
 # ---- Fast / parallel analysis: read only the ROI, split the video into parts ----
@@ -457,8 +415,7 @@ def run_parallel_stream(sess, p, parts=2, t0=None, t1=None):
         out = results[k]
         for i, g, _pv in reader:
             if stop.is_set(): return
-            r = detect_gray(g, rect[0], rect[1], p)
-            out.append((i, r['found'], r['y'], r['state']))
+            out.append((i, wa.measure_frame(g)))
             counts[k] = len(out)
 
     def worker(k):
@@ -493,16 +450,17 @@ def run_parallel_stream(sess, p, parts=2, t0=None, t1=None):
     if not dets:
         yield {'error': 'No frames could be decoded.'}; return
     wall = max(1e-6, time.time() - t_start)
-    ctr = RotationCounter(p, fps)
-    for i, found, y, state in dets:
-        ctr.step(i, {'found': found, 'y': y, 'state': state})
+    try:
+        sol = wa.solve([r for _, r in dets], p)
+    except RuntimeError as e:
+        yield {'error': str(e)}; return
     extra = [f"Parallel parts: {n}",
              f"Processing time: {wall:.2f} s ({len(dets) / wall:.0f} frames/s)"]
     if len(dets) < n_frames:
         extra.append(f"Warning: decoded {len(dets)} of {n_frames} frames")
     extra += notes
     print(f"PARALLEL ANALYSIS: {len(dets)} frames, {n} parts, {wall:.1f}s ({len(dets) / wall:.0f} fps)")
-    yield finish_event(ctr, len(dets), sf, ef, total, fps, extra)
+    yield finish_event(sol, [i for i, _ in dets], rect[0], rect[1], fps, p, sf, ef, total, extra)
 
 
 # ---------- Routes ----------
@@ -571,7 +529,7 @@ def render():
             res = detect_gray(cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY), x0, y0, p)
         disp, sc = fit_display(frame)
         rot = d.get('rot')
-        draw_overlay(disp, res, p, sc, None if rot is None else int(rot))
+        draw_overlay(disp, res, p, sc, None if rot is None else float(rot))
     out = {'image': encode_jpeg(disp), 'state': res['state'], 'found': res['found'],
            'y': res['y'] if res['found'] else None}
     print(f"RENDER frame {idx}: decode {1000 * (t1 - t0):.0f} ms, rest {1000 * (time.time() - t1):.0f} ms")
@@ -771,7 +729,7 @@ progress::-moz-progress-bar{background:#4299e1}
         <button id="btnLeft" onclick="setPickMode('left')">3) Set Wheel LEFT edge</button>
         <button id="btnRight" onclick="setPickMode('right')">4) Set Wheel RIGHT edge</button>
       </div>
-      <div id="statusMsg" class="status">Set the Top, Bottom, Left, and Right boundaries of the wheel to create a tracking box.</div>
+      <div id="statusMsg" class="status">Set the Top, Bottom, Left and Right boundaries so the box surrounds the whole wheel (small margin is fine). The wheel and the tape are found automatically inside it.</div>
       <div class="stats">
         <div>State<span id="lblState" class="big">-</span></div>
         <div>Y<span id="lblY" class="big">-</span></div>
