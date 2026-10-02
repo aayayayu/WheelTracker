@@ -152,7 +152,11 @@ def _to_np(jarr):
     try:
         return np.frombuffer(jarr, dtype=np.uint8)          # buffer protocol (fast)
     except Exception:
-        return np.array(jarr, dtype=np.int8).view(np.uint8)  # slow but always works
+        pass
+    try:
+        return np.frombuffer(bytes(jarr), dtype=np.uint8)   # one memcpy: still fast
+    except Exception:
+        return np.array(jarr, dtype=np.int8).view(np.uint8)  # very slow, last resort
 
 
 def _to_bgr(f):
@@ -172,11 +176,10 @@ def hw_range_reader(sess, sf, ef):
     n = 0
     try:
         while True:
-            f = s.poll()
+            f = s.pollWait(20)        # blocks in Java (GIL released) until a frame is ready
             if f is None:
                 if s.isDone():
                     break
-                time.sleep(0.001)
                 continue
             n += 1
             yield int(f.idx), _to_bgr(f)

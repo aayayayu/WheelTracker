@@ -27,6 +27,7 @@ import cv2
 N_PROFILE = 200      # vertical resolution of the brightness profile
 DARK_THR = 0.70      # tape = profile below 70% of its usual brightness
 NEW_LAP_JUMP = 0.30  # tape y jumping back up by more than this = new lap
+DETECT_EVERY = 4     # calibrated runs: full-frame flywheel detection only on every 4th frame (box may only drift a few px anyway)
 MAX_PENDING = 240    # frames kept (grayscale) while waiting for the very first flywheel detection
 
 
@@ -146,6 +147,7 @@ class BoxTracker:
         self.cfg = cfg
         self.pos = (float(cfg.ref[0]), float(cfg.ref[1]))
         self.state = 'held'
+        self.last_measured = False
 
     def _match(self, gray):
         c = self.cfg
@@ -203,7 +205,13 @@ class BoxTracker:
         x = min(max(x, 0), W - rw)
         y = min(max(y, 0), H - rh)
         self.pos = (x, y)
+        self.last_measured = measured
         return (int(round(x)), int(round(y)), rw, rh), measured
+
+    def hold(self):
+        """Frame without a detection pass (speed): keep the previous box and its measured flag."""
+        rw, rh = self.cfg.ref[2], self.cfg.ref[3]
+        return (int(round(self.pos[0])), int(round(self.pos[1])), rw, rh), self.last_measured
 
 
 class FrameExtractor:
@@ -211,8 +219,9 @@ class FrameExtractor:
     box in use and the profile. Frames that arrive before the first detection wait (as grayscale)
     until a box is known."""
 
-    def __init__(self, scale=1.0, cfg=None):
+    def __init__(self, scale=1.0, cfg=None, detect_every=DETECT_EVERY):
         self.scale = scale
+        self.detect_every = max(1, int(detect_every))
         self.tracker = BoxTracker(cfg) if cfg is not None else None
         self.idx, self.raw, self.box, self.prof = [], [], [], []
         self.pending = {}                 # position -> gray frame, waiting for a box
@@ -220,15 +229,24 @@ class FrameExtractor:
 
     def feed(self, i, bgr):
         """Returns (raw_box_or_None, box_in_use_or_None, profile_or_None) for this frame."""
-        raw = detect_flywheel(bgr, self.scale)
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         if self.tracker is not None:                      # calibrated: fixed-size box, small drift
-            box, ok = self.tracker.update(gray, raw)
+            if self.detect_every > 1 and self.idx and int(i) % self.detect_every:
+                # speed: no full-frame detection on this frame; only the box area is converted
+                box, ok = self.tracker.hold()
+                x, y, w, h = box
+                sub = cv2.cvtColor(bgr[y:y + h, x:x + w], cv2.COLOR_BGR2GRAY)
+                pr = profile_of(sub, (0, 0, w, h))
+            else:
+                raw = detect_flywheel(bgr, self.scale)
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                box, ok = self.tracker.update(gray, raw)
+                pr = profile_of(gray, box)
             raw = box if ok else None                     # raw = box was measured (else held/guessed)
-            pr = profile_of(gray, box)
             self.idx.append(int(i)); self.raw.append(raw); self.box.append(box); self.prof.append(pr)
             self.last = box
             return raw, box, pr
+        raw = detect_flywheel(bgr, self.scale)
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         if raw is not None:
             self.last = raw
         pos = len(self.idx)
@@ -398,7 +416,7 @@ class LiveTracker:
         if prof is not None:
             self.P.append(prof)
             m = len(self.P)
-            if m >= 15 and (self.med is None or m % (5 if m < 60 else 25) == 0):
+            if m >= 15 and (self.med is None or m % (5 if m < 60 else max(25, m // 20)) == 0):
                 first = self.med is None
                 self.med = np.maximum(np.median(np.array(self.P), axis=0), 1e-6)
                 if first:

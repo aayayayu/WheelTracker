@@ -342,11 +342,16 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=
     clk = {'origin': None, 'begin': None}
     notes = []
     t_start = time.time()
+    tm = {'feed': 0.0, 'live': 0.0, 'prev': 0.0}
 
     def consume(reader):
         for i, bgr in reader:
+            t_a = time.perf_counter()
             raw, box, pr = _feed(ext, i, bgr)
+            t_b = time.perf_counter()
             lv = ctr.step(pr)
+            t_c = time.perf_counter()
+            tm['feed'] += t_b - t_a; tm['live'] += t_c - t_b
             st['proc'] += 1; st['next'] = i + 1
             at = None
             if cap:
@@ -389,7 +394,9 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=
     extra = ["parallel parts: 1", f"processing time: {dt:.2f} s ({proc / dt:.0f} frames/s)"]
     if proc < n_total: extra.append(f"warning: decoded {proc} of {n_total} frames")
     extra += notes
-    print(f"ANALYSIS: {proc} frames in {dt:.1f}s ({proc / dt:.0f} fps)")
+    print(f"ANALYSIS: {proc} frames in {dt:.1f}s ({proc / dt:.0f} fps); per frame: "
+          f"feed {1000 * tm['feed'] / proc:.1f} ms, live {1000 * tm['live'] / proc:.1f} ms, "
+          f"rest (decode wait / preview / pacing) {1000 * (dt - tm['feed'] - tm['live']) / proc:.1f} ms")
     sol = _solve([ext], p)
     yield finish_event(sol, fps, p, sf, ef, extra, sess)
 

@@ -42,6 +42,7 @@ class FdSession(
     private val worker = Thread { run() }.apply { isDaemon = true; start() }
 
     fun poll(): FdFrame? = queue.poll()
+    fun pollWait(ms: Long): FdFrame? = queue.poll(ms, TimeUnit.MILLISECONDS)
     fun isDone(): Boolean = finished && queue.isEmpty()
     fun errorMessage(): String? = err
     fun close() { stopFlag = true }
@@ -199,17 +200,33 @@ class FdSession(
             val hi = if (yps > 1) 1 else 0
 
             val out = ByteArray(ow * oh * 3)
+            // Column offsets are the same for every row: compute once. Rows are then copied out of
+            // the (slow, bounds-checked) ByteBuffers with ONE bulk get per row instead of 3 per pixel.
+            val yCol = IntArray(ow) { it * step * yps + hi }
+            val cCol0 = crop.left shr 1
+            val uCol = IntArray(ow) { (((crop.left + it * step) shr 1) - cCol0) * ups + hi }
+            val vCol = IntArray(ow) { (((crop.left + it * step) shr 1) - cCol0) * vps + hi }
+            val yRowBuf = ByteArray(yCol[ow - 1] + 1)
+            val uRowBuf = ByteArray(uCol[ow - 1] + 1)
+            val vRowBuf = ByteArray(vCol[ow - 1] + 1)
+            var lastC = -1
             var o = 0
             for (row in 0 until oh) {
                 val sy = crop.top + row * step
-                val yRow = sy * yrs
-                val cRowU = (sy shr 1) * urs
-                val cRowV = (sy shr 1) * vrs
+                yb.position(sy * yrs + crop.left * yps)
+                yb.get(yRowBuf, 0, minOf(yRowBuf.size, yb.remaining()))
+                val cy = sy shr 1
+                if (cy != lastC) {
+                    ub.position(cy * urs + cCol0 * ups)
+                    ub.get(uRowBuf, 0, minOf(uRowBuf.size, ub.remaining()))
+                    vb.position(cy * vrs + cCol0 * vps)
+                    vb.get(vRowBuf, 0, minOf(vRowBuf.size, vb.remaining()))
+                    lastC = cy
+                }
                 for (col in 0 until ow) {
-                    val sx = crop.left + col * step
-                    val y = yb.get(yRow + sx * yps + hi).toInt() and 0xFF
-                    val u = (ub.get(cRowU + (sx shr 1) * ups + hi).toInt() and 0xFF) - 128
-                    val v = (vb.get(cRowV + (sx shr 1) * vps + hi).toInt() and 0xFF) - 128
+                    val y = yRowBuf[yCol[col]].toInt() and 0xFF
+                    val u = (uRowBuf[uCol[col]].toInt() and 0xFF) - 128
+                    val v = (vRowBuf[vCol[col]].toInt() and 0xFF) - 128
                     val yy = (y - k.off) * k.cy
                     out[o] = clamp((yy + k.cbu * u) shr 8).toByte()                  // B
                     out[o + 1] = clamp((yy - k.cgu * u - k.cgv * v) shr 8).toByte()  // G
