@@ -21,6 +21,7 @@ class FdFrame(
     @JvmField val h: Int,
     @JvmField val rotation: Int,
     @JvmField val data: ByteArray,
+    @JvmField val light: Boolean = false,   // true: data = grayscale of the region set with setRoi (w x h)
 )
 
 /**
@@ -33,11 +34,13 @@ class FdSession(
     private val endFrame: Int,
     private val fps: Double,
     private val step: Int,           // keep every step-th pixel in x and y (1 = full resolution)
+    private val every: Int,          // >1: only every `every`-th frame is delivered whole, the others as a gray region
 ) {
-    private val queue = ArrayBlockingQueue<FdFrame>(16)
+    private val queue = ArrayBlockingQueue<FdFrame>(64)
     @Volatile private var finished = false
     @Volatile private var stopFlag = false
     @Volatile private var err: String? = null
+    @Volatile private var roi: IntArray? = null     // x0, y0, x1, y1 on the sub-sampled grid, raw orientation
 
     private val worker = Thread { run() }.apply { isDaemon = true; start() }
 
@@ -46,6 +49,7 @@ class FdSession(
     fun isDone(): Boolean = finished && queue.isEmpty()
     fun errorMessage(): String? = err
     fun close() { stopFlag = true }
+    fun setRoi(x0: Int, y0: Int, x1: Int, y1: Int) { roi = intArrayOf(x0, y0, x1, y1) }
 
     private fun offer(f: FdFrame): Boolean {
         while (!stopFlag) {
@@ -120,6 +124,7 @@ class FdSession(
             val info = MediaCodec.BufferInfo()
             var inputDone = false
             var outputDone = false
+            var delivered = 0
 
             while (!outputDone && !stopFlag) {
                 if (!inputDone) {
@@ -144,7 +149,12 @@ class FdSession(
                     if (idx >= endFrame) {
                         outputDone = true
                     } else if (idx >= startFrame && info.size > 0) {
-                        val frame = extract(c, oi, idx, rotation, yuvFor(fullRange, bt709))
+                        val k = yuvFor(fullRange, bt709)
+                        val r = roi
+                        val frame = if (every > 1 && r != null && delivered > 0 && idx % every != 0)
+                            extractLight(c, oi, idx, rotation, k, r)
+                        else extract(c, oi, idx, rotation, k)
+                        delivered++
                         if (!offer(frame)) outputDone = true
                     }
                     c.releaseOutputBuffer(oi, false)
@@ -171,6 +181,43 @@ class FdSession(
     }
 
     private fun clamp(v: Int): Int = if (v < 0) 0 else if (v > 255) 255 else v
+
+    /** Fast path: only the luma of region r (sub-sampled grid), scaled like the BGR conversion does. */
+    private fun extractLight(c: MediaCodec, oi: Int, idx: Int, rotation: Int, k: Yuv, r: IntArray): FdFrame {
+        val img = c.getOutputImage(oi)
+            ?: throw IllegalStateException("decoder gives no Image output")
+        try {
+            val crop = img.cropRect
+            val ow = crop.width() / step
+            val oh = crop.height() / step
+            val x0 = maxOf(0, r[0]); val y0 = maxOf(0, r[1])
+            val x1 = minOf(ow, r[2]); val y1 = minOf(oh, r[3])
+            val w = x1 - x0
+            val h = y1 - y0
+            if (w <= 0 || h <= 0) throw IllegalStateException("empty region")
+            val yP = img.planes[0]
+            val yb = yP.buffer
+            val yrs = yP.rowStride
+            val yps = yP.pixelStride
+            val hi = if (yps > 1) 1 else 0
+            val yCol = IntArray(w) { it * step * yps + hi }
+            val rowBuf = ByteArray(yCol[w - 1] + 1)
+            val out = ByteArray(w * h)
+            for (row in 0 until h) {
+                val sy = crop.top + (y0 + row) * step
+                yb.position(sy * yrs + (crop.left + x0 * step) * yps)
+                yb.get(rowBuf, 0, minOf(rowBuf.size, yb.remaining()))
+                val o = row * w
+                for (col in 0 until w) {
+                    val y = rowBuf[yCol[col]].toInt() and 0xFF
+                    out[o + col] = clamp(((y - k.off) * k.cy) shr 8).toByte()
+                }
+            }
+            return FdFrame(idx, w, h, rotation, out, true)
+        } finally {
+            img.close()
+        }
+    }
 
     /** Reads one decoder output picture, sub-samples it by `step` and converts it to BGR. */
     private fun extract(c: MediaCodec, oi: Int, idx: Int, rotation: Int, k: Yuv): FdFrame {
@@ -247,6 +294,6 @@ object FastDecoder {
      * (1 = full resolution) and converted to BGR.
      */
     @JvmStatic
-    fun open(path: String, startFrame: Int, endFrame: Int, fps: Double, step: Int): FdSession =
-        FdSession(path, startFrame, endFrame, fps, maxOf(1, step))
+    fun open(path: String, startFrame: Int, endFrame: Int, fps: Double, step: Int, every: Int): FdSession =
+        FdSession(path, startFrame, endFrame, fps, maxOf(1, step), maxOf(1, every))
 }

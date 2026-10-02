@@ -310,6 +310,16 @@ def make_cfg(sess, d, sf=0):
     return wa.TrackCfg(np.median(np.array(found, dtype=float), axis=0), ref, area_tol, drift)
 
 
+def _detect_every(fps):
+    """Full-frame flywheel detection about 6 times per second of video (at least every 4th frame)."""
+    return max(4, int(round(float(fps or 30.0) / 6.0)))
+
+
+def _light(cfg, every):
+    """Ask the reader for region-only frames between the detection frames."""
+    return {'roi': cfg.light_roi(), 'every': every} if cfg is not None and every > 1 else None
+
+
 def _feed(ext, i, bgr):
     try: return ext.feed(i, bgr)
     except RuntimeError as e: raise UserError(str(e))
@@ -335,8 +345,10 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=
     n_total = ef - sf
     if n_total <= 0:
         yield {'error': 'Nothing to analyse (empty time range).'}; return
-    ext, ctr = wa.FrameExtractor(sess['scale'], cfg), wa.LiveTracker(p)
+    every_det = _detect_every(fps)
+    ext, ctr = wa.FrameExtractor(sess['scale'], cfg, every_det), wa.LiveTracker(p)
     cap = float(fps_cap) if (live and fps_cap and fps_cap > 0) else 0.0
+    light = None if cap else _light(cfg, every_det)     # paced preview needs every frame whole
     pe = (1 if cap else max(1, int(every))) if live else 0
     st = {'proc': 0, 'next': sf, 'last_pv': 0.0}
     clk = {'origin': None, 'begin': None}
@@ -362,7 +374,7 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=
                 elif now - due > 0.25: clk['begin'] += now - due     # fell behind: no burst catch-up
                 at = clk['begin'] + (st['proc'] - 1) / cap - clk['origin']
             want = False
-            if live:
+            if live and not isinstance(bgr, wa.LightFrame):
                 if cap: want = True
                 else:
                     now = time.time()
@@ -380,7 +392,7 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=
                                    'laps': lv['laps'], 'total_frames': n_total, 'start_frame': sf}}
 
     try:
-        yield from consume(RANGE_READER(sess, sf, ef))
+        yield from consume(RANGE_READER(sess, sf, ef, light))
     except UserError:
         raise
     except Exception as e:
@@ -402,7 +414,7 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=
 
 
 # ---- Fast / parallel analysis: split the video into parts, measure each part on its own thread ----
-def cv_range_reader(sess, sf, ef):
+def cv_range_reader(sess, sf, ef, light=None):
     """Generic reader: yields (frame_index, BGR frame sub-sampled by sess['step']) for frames
     [sf, ef). Android replaces RANGE_READER with a hardware-decoder version (main.py)."""
     st = sess['step']
@@ -431,7 +443,9 @@ def run_parallel_stream(sess, p, parts=2, t0=None, t1=None, cfg=None):
         yield {'error': 'Nothing to analyse (empty time range).'}; return
     n = max(1, min(int(parts), 8, n_frames))
     edges = [sf + n_frames * k // n for k in range(n + 1)]
-    exts = [wa.FrameExtractor(sess['scale'], cfg) for _ in range(n)]
+    every_det = _detect_every(fps)
+    light = _light(cfg, every_det)
+    exts = [wa.FrameExtractor(sess['scale'], cfg, every_det) for _ in range(n)]
     counts, errs, notes = [0] * n, [None] * n, []
     stop = threading.Event()
 
@@ -445,14 +459,14 @@ def run_parallel_stream(sess, p, parts=2, t0=None, t1=None, cfg=None):
     def worker(k):
         a, b = edges[k], edges[k + 1]
         try:
-            consume(k, RANGE_READER(sess, a, b))
+            consume(k, RANGE_READER(sess, a, b, light))
         except UserError as e:
             errs[k] = str(e); stop.set()
         except Exception as e:
             if RANGE_READER is cv_range_reader:
                 errs[k] = str(e); return
             notes.append(f"part {k + 1}: fast decoder failed ({e}); used slow fallback")
-            exts[k] = wa.FrameExtractor(sess['scale'], cfg); counts[k] = 0
+            exts[k] = wa.FrameExtractor(sess['scale'], cfg, every_det); counts[k] = 0
             try:
                 consume(k, cv_range_reader(sess, a, b))
             except Exception as e2:

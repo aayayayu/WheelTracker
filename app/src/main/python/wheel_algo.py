@@ -94,7 +94,11 @@ def _median_filter_nearest(a, k):
     """1-D median filter, odd window k, edges extended with the nearest value (= scipy 'nearest')."""
     h = k // 2
     pad = np.pad(a, (h, h), mode='edge')
-    return np.median(np.stack([pad[i:i + len(a)] for i in range(k)]), axis=0)
+    try:
+        from numpy.lib.stride_tricks import sliding_window_view
+        return np.partition(sliding_window_view(pad, k), h, axis=1)[:, h]     # 3-4x faster
+    except Exception:
+        return np.median(np.stack([pad[i:i + len(a)] for i in range(k)]), axis=0)
 
 
 def profile_of(gray, box):
@@ -109,12 +113,22 @@ def profile_of(gray, box):
     return p / np.maximum(base, 1)
 
 
+class LightFrame:
+    """A frame that was NOT delivered as a full picture: only the grayscale of a small region around
+    the flywheel (displayed orientation). gray covers displayed pixels x >= ox, y >= oy."""
+    __slots__ = ('gray', 'ox', 'oy')
+
+    def __init__(self, gray, ox, oy):
+        self.gray, self.ox, self.oy = gray, ox, oy
+
+
 class TrackCfg:
     """Calibration of the flywheel box: fixed size, small allowed drift, appearance template.
     box = (x, y, w, h) and frame = BGR image, both in the pixels that are analysed."""
 
     def __init__(self, box, frame, area_tol=0.10, drift=0.06):
         H, W = frame.shape[:2]
+        self.size = (W, H)
         x, y, w, h = [int(round(float(v))) for v in box]
         w, h = max(8, min(w, W)), max(8, min(h, H))
         x, y = min(max(0, x), W - w), min(max(0, y), H - h)
@@ -127,6 +141,13 @@ class TrackCfg:
         g = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (3, 3), 0)
         self.tmpl = np.ascontiguousarray(g[y0:y1, x0:x1])
         self.off = (x - x0, y - y0)                           # where the box sits inside the template
+
+    def light_roi(self):
+        """Region (x0, y0, x1, y1) that always contains the box (it only drifts `shift` px)."""
+        W, H = self.size
+        x, y, w, h = self.ref
+        m = self.shift + 2
+        return (max(0, x - m), max(0, y - m), min(W, x + w + m), min(H, y + h + m))
 
 
 class BoxTracker:
@@ -229,6 +250,14 @@ class FrameExtractor:
 
     def feed(self, i, bgr):
         """Returns (raw_box_or_None, box_in_use_or_None, profile_or_None) for this frame."""
+        if self.tracker is not None and isinstance(bgr, LightFrame):   # region only (fast path)
+            box, ok = self.tracker.hold()
+            x, y, w, h = box
+            pr = profile_of(bgr.gray, (x - bgr.ox, y - bgr.oy, w, h))
+            raw = box if ok else None
+            self.idx.append(int(i)); self.raw.append(raw); self.box.append(box); self.prof.append(pr)
+            self.last = box
+            return raw, box, pr
         if self.tracker is not None:                      # calibrated: fixed-size box, small drift
             if self.detect_every > 1 and self.idx and int(i) % self.detect_every:
                 # speed: no full-frame detection on this frame; only the box area is converted

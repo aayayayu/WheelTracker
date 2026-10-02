@@ -168,12 +168,16 @@ def _to_bgr(f):
     return a
 
 
-def hw_range_reader(sess, sf, ef):
-    """Yield (frame_index, BGR frame sub-sampled by sess['step']) for frames [sf, ef) using MediaCodec."""
+def hw_range_reader(sess, sf, ef, light=None):
+    """Yield (frame_index, frame) for frames [sf, ef) using MediaCodec. frame is a BGR image
+    sub-sampled by sess['step'] or, when `light` = {'roi': (x0, y0, x1, y1), 'every': N} is given, a
+    wheel_algo.LightFrame (grayscale of the roi only) for every frame that is not a multiple of N."""
     from java import jclass
+    import wheel_algo as wa
     FD = jclass("com.example.wheeltracker.FastDecoder")
-    s = FD.open(sess['video_path'], int(sf), int(ef), float(sess['fps']), int(sess['step']))
-    n = 0
+    every = int(light['every']) if light else 1
+    s = FD.open(sess['video_path'], int(sf), int(ef), float(sess['fps']), int(sess['step']), every)
+    n, roi_set = 0, False
     try:
         while True:
             f = s.pollWait(20)        # blocks in Java (GIL released) until a frame is ready
@@ -182,7 +186,27 @@ def hw_range_reader(sess, sf, ef):
                     break
                 continue
             n += 1
-            yield int(f.idx), _to_bgr(f)
+            if f.light:
+                k = (4 - int(f.rotation) // 90) % 4
+                a = _to_np(f.data).reshape(f.h, f.w)
+                if k:
+                    a = np.rot90(a, k)
+                yield int(f.idx), wa.LightFrame(a, light['roi'][0], light['roi'][1])
+                continue
+            bgr = _to_bgr(f)
+            if light and not roi_set:
+                # the decoder works in the raw orientation: tell it where the roi is there
+                x0, y0, x1, y1 = light['roi']
+                dh, dw = bgr.shape[:2]
+                x0, y0, x1, y1 = max(0, x0), max(0, y0), min(dw, x1), min(dh, y1)
+                k = (4 - int(f.rotation) // 90) % 4
+                m = np.zeros((dh, dw), bool)
+                m[y0:y1, x0:x1] = True
+                ys, xs = np.nonzero(np.rot90(m, -k))
+                s.setRoi(int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+                light = dict(light, roi=(x0, y0, x1, y1))
+                roi_set = True
+            yield int(f.idx), bgr
         err = s.errorMessage()
         if err:
             raise RuntimeError(err)
