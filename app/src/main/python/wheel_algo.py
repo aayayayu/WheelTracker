@@ -5,8 +5,10 @@ Port of flywheel_rotations.py to a streaming form, so a long video never has to 
 only a box and a 200-point brightness profile are kept per frame.
 
   1. detect_flywheel()   per frame: gray vertical block crossing the blue bracket -> (x, y, w, h).
-                         If detection fails the last known box is reused (the first known box for
-                         leading frames).
+                         With a TrackCfg (user calibration) the box SIZE never changes: BoxTracker only
+                         lets the fixed box drift a few pixels, and when the detected area is off by
+                         more than the tolerance it re-locates the box by template matching instead.
+                         Without a TrackCfg: the last known box is reused when detection fails.
   2. profile_of()        brightness profile of the box, divided by its own running baseline.
   3. observe_tape()      divide every profile by the median profile over time -> static parts (rod,
                          shaft, edges) cancel, only the moving black tape is left as a dark band.
@@ -106,13 +108,112 @@ def profile_of(gray, box):
     return p / np.maximum(base, 1)
 
 
+class TrackCfg:
+    """Calibration of the flywheel box: fixed size, small allowed drift, appearance template.
+    box = (x, y, w, h) and frame = BGR image, both in the pixels that are analysed."""
+
+    def __init__(self, box, frame, area_tol=0.10, drift=0.06):
+        H, W = frame.shape[:2]
+        x, y, w, h = [int(round(float(v))) for v in box]
+        w, h = max(8, min(w, W)), max(8, min(h, H))
+        x, y = min(max(0, x), W - w), min(max(0, y), H - h)
+        self.ref = (x, y, w, h)
+        self.area_tol = float(area_tol)                       # allowed |area / ref area - 1|
+        self.shift = max(0, int(round(float(drift) * w)))     # allowed drift from ref, px (x and y)
+        pad = max(4, int(.15 * w))
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(W, x + w + pad), min(H, y + h + pad)
+        g = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (3, 3), 0)
+        self.tmpl = np.ascontiguousarray(g[y0:y1, x0:x1])
+        self.off = (x - x0, y - y0)                           # where the box sits inside the template
+
+
+class BoxTracker:
+    """Keeps the flywheel box at the calibrated size and lets it move only a few pixels.
+
+    Per frame, in this order:
+      detected  detect_flywheel() gave a box whose area is within area_tol of the calibrated one:
+                its centre is used (its size is ignored).
+      anchored  the area is off (wheel partly hidden): per axis, the edge of the detection that is
+                still consistent with the calibrated position is kept and the other edge is ignored.
+      matched   detection missing, or an axis has no consistent edge: the calibration picture is
+                searched in a small window around the calibrated position (normalised correlation).
+      held      nothing usable: previous position.
+    The position is always clamped to calibrated position +/- shift."""
+    MIN_SCORE = 0.5
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.pos = (float(cfg.ref[0]), float(cfg.ref[1]))
+        self.state = 'held'
+
+    def _match(self, gray):
+        c = self.cfg
+        th, tw = c.tmpl.shape[:2]
+        H, W = gray.shape[:2]
+        tx0, ty0 = c.ref[0] - c.off[0], c.ref[1] - c.off[1]
+        s = c.shift
+        sx0, sy0 = max(0, tx0 - s), max(0, ty0 - s)
+        sx1, sy1 = min(W, tx0 + tw + s), min(H, ty0 + th + s)
+        if sx1 - sx0 < tw or sy1 - sy0 < th:
+            return None
+        reg = cv2.GaussianBlur(gray[sy0:sy1, sx0:sx1], (3, 3), 0)
+        res = cv2.matchTemplate(reg, c.tmpl, cv2.TM_CCOEFF_NORMED)
+        _, score, _, loc = cv2.minMaxLoc(res)
+        if score < self.MIN_SCORE:
+            return None
+        return (sx0 + loc[0] + c.off[0], sy0 + loc[1] + c.off[1])
+
+    def update(self, gray, raw):
+        """gray: uint8 frame, raw: detect_flywheel() result or None.
+        Returns ((x, y, w, h), measured) - measured is False when the position is only a guess."""
+        c = self.cfg
+        H, W = gray.shape[:2]
+        rx, ry, rw, rh = c.ref
+        pos, measured, self.state = None, False, 'held'
+        if raw is not None and abs(raw[2] * raw[3] / float(rw * rh) - 1.0) <= c.area_tol:
+            pos, measured, self.state = (raw[0] + (raw[2] - rw) / 2.0, raw[1] + (raw[3] - rh) / 2.0), True, 'detected'
+        s = c.shift
+        if pos is None and raw is not None:
+            # Area is off (hand / glare / shadow hides part of the wheel). Per axis, one edge of the
+            # detection is usually still right: use the edge whose implied box position stays within
+            # the drift limit and is nearest to the previous box.
+            x, y, w, h = raw
+            px, py = self.pos
+
+            def pick(lo, hi, p, r):
+                ok = [v for v in (lo, hi) if abs(v - r) <= s + 1]
+                return min(ok, key=lambda v: abs(v - p)) if ok else None
+            ax, ay = pick(x, x + w - rw, px, rx), pick(y, y + h - rh, py, ry)
+            if ax is not None and ay is not None:
+                pos, measured, self.state = (ax, ay), True, 'anchored'
+            else:
+                m = self._match(gray)                      # an axis has no trustworthy edge
+                if m is not None:
+                    pos = (ax if ax is not None else m[0], ay if ay is not None else m[1])
+                    measured, self.state = True, 'matched'
+        if pos is None:
+            m = self._match(gray)                          # not detected at all
+            if m is not None:
+                pos, measured, self.state = m, True, 'matched'
+        if pos is None:
+            pos = self.pos                                 # nothing usable: hold
+        x = min(max(pos[0], rx - s), rx + s)
+        y = min(max(pos[1], ry - s), ry + s)
+        x = min(max(x, 0), W - rw)
+        y = min(max(y, 0), H - rh)
+        self.pos = (x, y)
+        return (int(round(x)), int(round(y)), rw, rh), measured
+
+
 class FrameExtractor:
     """Steps 1-2 for a run of frames, fed in order. Keeps per frame: index, raw detection (or None),
     box in use and the profile. Frames that arrive before the first detection wait (as grayscale)
     until a box is known."""
 
-    def __init__(self, scale=1.0):
+    def __init__(self, scale=1.0, cfg=None):
         self.scale = scale
+        self.tracker = BoxTracker(cfg) if cfg is not None else None
         self.idx, self.raw, self.box, self.prof = [], [], [], []
         self.pending = {}                 # position -> gray frame, waiting for a box
         self.last = None
@@ -120,9 +221,16 @@ class FrameExtractor:
     def feed(self, i, bgr):
         """Returns (raw_box_or_None, box_in_use_or_None, profile_or_None) for this frame."""
         raw = detect_flywheel(bgr, self.scale)
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        if self.tracker is not None:                      # calibrated: fixed-size box, small drift
+            box, ok = self.tracker.update(gray, raw)
+            raw = box if ok else None                     # raw = box was measured (else held/guessed)
+            pr = profile_of(gray, box)
+            self.idx.append(int(i)); self.raw.append(raw); self.box.append(box); self.prof.append(pr)
+            self.last = box
+            return raw, box, pr
         if raw is not None:
             self.last = raw
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         pos = len(self.idx)
         self.idx.append(int(i)); self.raw.append(raw); self.box.append(self.last)
         if self.last is None:

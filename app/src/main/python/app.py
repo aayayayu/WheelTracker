@@ -266,6 +266,50 @@ def _frame_range(sess, t0, t1):
     return fps, total, sf, ef
 
 
+def draw_calib(out, s, c):
+    """Calibration box (x, y, w, h in ORIGINAL pixels) as a cyan rectangle."""
+    x, y, w, h = [int(round(float(c[k]) * s)) for k in 'xywh']
+    cv2.rectangle(out, (x, y), (x + w, y + h), (255, 200, 0), 1)
+    cv2.putText(out, "calibration", (x + 3, max(14, y - 5)), FONT, 0.45, (255, 200, 0), 1)
+
+
+def _pct(d, key, default, lo, hi):
+    try: v = float(d.get(key, default))
+    except (TypeError, ValueError): v = default
+    return min(hi, max(lo, v)) / 100.0
+
+
+def make_cfg(sess, d, sf=0):
+    """Fixed-size flywheel box for the whole run. The user's calibration box (original pixels) if
+    given, otherwise the median detection over the first frames of the range."""
+    st, sc = sess['step'], sess['scale']
+    area_tol, drift = _pct(d, 'area_tol_pct', 10, 1, 50), _pct(d, 'max_drift_pct', 6, 0, 30)
+    c = d.get('calib')
+    if c:
+        try:
+            box = [float(c[k]) / st for k in 'xywh']
+            fi = max(0, min(int(c.get('frame', sf)), sess['total_frames'] - 1))
+        except (TypeError, ValueError, KeyError):
+            raise UserError('The calibration box is not valid.')
+        if box[2] < 8 or box[3] < 8: raise UserError('The calibration box is too small.')
+        fr = sess['src'].get(fi)
+        if fr is None: raise UserError('Cannot read the calibration frame.')
+        return wa.TrackCfg(box, fr[::st, ::st], area_tol, drift)
+    found, ref = [], None
+    for fi in range(sf, min(sess['total_frames'], sf + 120), 15):
+        fr = sess['src'].get(fi)
+        if fr is None: continue
+        small = fr[::st, ::st]
+        b = wa.detect_flywheel(small, sc)
+        if b is not None:
+            found.append(b)
+            if ref is None: ref = small
+    if not found:
+        raise UserError('The flywheel was not found automatically. Calibrate it by hand '
+                        '(Flywheel Calibration panel).')
+    return wa.TrackCfg(np.median(np.array(found, dtype=float), axis=0), ref, area_tol, drift)
+
+
 def _feed(ext, i, bgr):
     try: return ext.feed(i, bgr)
     except RuntimeError as e: raise UserError(str(e))
@@ -280,7 +324,7 @@ def _solve(exts, p):
 
 
 # ---------- Analysis stream ----------
-def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=0):
+def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=0, cfg=None):
     """Sequential analysis with an optional live preview (annotated frames with a running estimate;
     the exact result comes from the final solve). The hardware decoder delivers full colour frames
     (RANGE_READER); the preview is made from the very same frame, so it costs no extra decoding.
@@ -291,7 +335,7 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=
     n_total = ef - sf
     if n_total <= 0:
         yield {'error': 'Nothing to analyse (empty time range).'}; return
-    ext, ctr = wa.FrameExtractor(sess['scale']), wa.LiveTracker(p)
+    ext, ctr = wa.FrameExtractor(sess['scale'], cfg), wa.LiveTracker(p)
     cap = float(fps_cap) if (live and fps_cap and fps_cap > 0) else 0.0
     pe = (1 if cap else max(1, int(every))) if live else 0
     st = {'proc': 0, 'next': sf, 'last_pv': 0.0}
@@ -369,7 +413,7 @@ def cv_range_reader(sess, sf, ef):
 RANGE_READER = cv_range_reader
 
 
-def run_parallel_stream(sess, p, parts=2, t0=None, t1=None):
+def run_parallel_stream(sess, p, parts=2, t0=None, t1=None, cfg=None):
     """Split [start, end) into `parts` chunks, find the flywheel and take the brightness profile of
     every frame of a chunk on its own thread (per-frame measurement is independent), then join the
     chunks (the 'last known box' rule carries over chunk borders) and track the tape ONCE, in order.
@@ -380,7 +424,7 @@ def run_parallel_stream(sess, p, parts=2, t0=None, t1=None):
         yield {'error': 'Nothing to analyse (empty time range).'}; return
     n = max(1, min(int(parts), 8, n_frames))
     edges = [sf + n_frames * k // n for k in range(n + 1)]
-    exts = [wa.FrameExtractor(sess['scale']) for _ in range(n)]
+    exts = [wa.FrameExtractor(sess['scale'], cfg) for _ in range(n)]
     counts, errs, notes = [0] * n, [None] * n, []
     stop = threading.Event()
 
@@ -401,7 +445,7 @@ def run_parallel_stream(sess, p, parts=2, t0=None, t1=None):
             if RANGE_READER is cv_range_reader:
                 errs[k] = str(e); return
             notes.append(f"part {k + 1}: fast decoder failed ({e}); used slow fallback")
-            exts[k] = wa.FrameExtractor(sess['scale']); counts[k] = 0
+            exts[k] = wa.FrameExtractor(sess['scale'], cfg); counts[k] = 0
             try:
                 consume(k, cv_range_reader(sess, a, b))
             except Exception as e2:
@@ -513,6 +557,10 @@ def render():
         draw_overlay(disp, sc, box, box is not None)
         out = {'wheel': 'detected' if box is not None else 'none', 'tape': None, 'y': None,
                'rotation_count': None, 'laps': None}
+    c = d.get('calib')
+    if c:
+        try: draw_calib(disp, sc, c)
+        except (TypeError, ValueError, KeyError): pass
     out['image'] = encode_jpeg(disp)
     print(f"RENDER frame {idx}: decode {1000 * (t1 - t0):.0f} ms, rest {1000 * (time.time() - t1):.0f} ms")
     return jsonify(out)
@@ -547,6 +595,21 @@ def crop_strip():
                     'duration': round(dur, 3), 'fps': fps})
 
 
+@app.route('/detect', methods=['POST'])
+def detect():
+    """Auto-detected flywheel box (original pixels) of one frame: start point for calibration."""
+    d = request.get_json(force=True)
+    sess = SESSIONS.get(d.get('sid'))
+    if not sess: return jsonify({'error': 'invalid session'}), 400
+    idx = max(0, min(int(d.get('frame_idx', 0)), sess['total_frames'] - 1))
+    frame = sess['src'].get(idx)
+    if frame is None: return jsonify({'error': 'cannot read frame'}), 400
+    st = sess['step']
+    b = wa.detect_flywheel(frame[::st, ::st], sess['scale'])
+    if b is None: return jsonify({'error': 'Flywheel not detected in this frame - move the slider or enter the box by hand.'})
+    return jsonify({'box': [int(v * st) for v in b], 'frame': idx})
+
+
 def _time_range(d):
     t0 = d.get('time_start'); t1 = d.get('time_end')
     t0 = max(0.0, float(t0)) if t0 is not None else None
@@ -570,8 +633,9 @@ def analyze():
     def gen():
         try:
             # Without live preview nothing has to be drawn: use the plain one-part reader path.
-            it = run_analysis_stream(sess, p, live, every, t0, t1, fps_cap) if live \
-                 else run_parallel_stream(sess, p, 1, t0, t1)
+            cfg = make_cfg(sess, d, _frame_range(sess, t0, t1)[2])
+            it = run_analysis_stream(sess, p, live, every, t0, t1, fps_cap, cfg) if live \
+                 else run_parallel_stream(sess, p, 1, t0, t1, cfg)
             for ev in it:
                 yield 'data: ' + _json.dumps(ev) + '\n\n'
         except Exception as e:
@@ -593,7 +657,8 @@ def fast_analyze():
 
     def gen():
         try:
-            for ev in run_parallel_stream(sess, p, parts, t0, t1):
+            cfg = make_cfg(sess, d, _frame_range(sess, t0, t1)[2])
+            for ev in run_parallel_stream(sess, p, parts, t0, t1, cfg):
                 yield 'data: ' + _json.dumps(ev) + '\n\n'
         except Exception as e:
             yield 'data: ' + _json.dumps({'error': str(e)}) + '\n\n'
@@ -722,6 +787,26 @@ progress::-moz-progress-bar{background:#4299e1}
   </div>
 
   <div>
+    <div class="panel">
+      <h3>Flywheel Calibration <span id="calBadge" class="badge crop-badge">CALIBRATED</span></h3>
+      <div class="hint" style="margin-bottom:8px">Pick a frame where the whole flywheel is visible, press <b>Auto-fill</b> (or type the box), then nudge it onto the flywheel. The box keeps this exact size for the whole video and may only drift a few pixels; if the detected area suddenly changes by more than the tolerance the box is re-located by matching the calibrated picture instead of being resized.</div>
+      <div class="row"><button onclick="calAuto()">Auto-fill from this frame</button>
+        <button class="secondary" onclick="calClear()">Clear</button></div>
+      <div class="row"><label style="width:34px">X</label><input type="number" id="calX" style="width:78px" onchange="calEdit()">
+        <button class="secondary" onclick="calNudge(-2,0,0,0)">&#9664;</button><button class="secondary" onclick="calNudge(2,0,0,0)">&#9654;</button>
+        <label style="width:34px;margin-left:8px">Y</label><input type="number" id="calY" style="width:78px" onchange="calEdit()">
+        <button class="secondary" onclick="calNudge(0,-2,0,0)">&#9650;</button><button class="secondary" onclick="calNudge(0,2,0,0)">&#9660;</button></div>
+      <div class="row"><label style="width:34px">W</label><input type="number" id="calW" style="width:78px" onchange="calEdit()">
+        <button class="secondary" onclick="calNudge(0,0,-2,0)">&minus;</button><button class="secondary" onclick="calNudge(0,0,2,0)">+</button>
+        <label style="width:34px;margin-left:8px">H</label><input type="number" id="calH" style="width:78px" onchange="calEdit()">
+        <button class="secondary" onclick="calNudge(0,0,0,-2)">&minus;</button><button class="secondary" onclick="calNudge(0,0,0,2)">+</button></div>
+      <div class="row"><label style="flex:1">Max drift (% of box width)</label>
+        <input type="number" id="driftPct" value="6" min="0" max="30" step="1" style="width:70px"></div>
+      <div class="row"><label style="flex:1">Area change tolerance (%)</label>
+        <input type="number" id="areaTol" value="10" min="1" max="50" step="1" style="width:70px"></div>
+      <div id="calInfo" class="status">Not calibrated: the box size is taken from the first detections of the video.</div>
+    </div>
+
     <div class="panel">
       <h3>Tape Detection</h3>
       <div class="row"><label style="flex:1">Dark threshold</label>
@@ -921,7 +1006,7 @@ progress::-moz-progress-bar{background:#4299e1}
 <script>
 const S = {sid:null, fps:30, totalFrames:0, origW:0, origH:0, duration:0,
   currentFrame:0, history:[], laps:[], analyzing:false, cropStart:0, cropEnd:0,
-  startSel:0, endSel:0};
+  startSel:0, endSel:0, calib:null};
 const STRIP_BEFORE = 3.0, STRIP_AFTER = 3.0, STRIP_N = 20;
 
 const $ = id => document.getElementById(id);
@@ -949,8 +1034,42 @@ function updateFastInfo() {
 function getParams() {
   return {sid: S.sid, frame_idx: S.currentFrame,
     dark_thr: +$('darkNum').value, new_lap_jump: +$('lapNum').value,
-    use_result: S.history.length > 0};
+    use_result: S.history.length > 0,
+    calib: S.calib || null, max_drift_pct: +$('driftPct').value, area_tol_pct: +$('areaTol').value};
 }
+
+// ---- flywheel calibration (box in ORIGINAL pixels, taken on frame S.calib.frame) ----
+function calShow() {
+  const c = S.calib;
+  ['X','Y','W','H'].forEach(k => { $('cal' + k).value = c ? c[k.toLowerCase()] : ''; });
+  $('calBadge').classList.toggle('active', !!c);
+  $('calInfo').textContent = c
+    ? `Calibrated on frame ${c.frame}: x ${c.x}, y ${c.y}, ${c.w} x ${c.h} px. Size is locked for the whole analysis.`
+    : 'Not calibrated: the box size is taken from the first detections of the video.';
+}
+async function calAuto() {
+  if (!S.sid) return alert('Load a video first.');
+  let d;
+  try { d = await postJSON('/detect', {sid: S.sid, frame_idx: S.currentFrame}); }
+  catch (e) { return alert('Detection failed: ' + e.message); }
+  if (d.error) return alert(d.error);
+  S.calib = {x: d.box[0], y: d.box[1], w: d.box[2], h: d.box[3], frame: d.frame};
+  calShow(); renderFrame();
+}
+function calEdit() {
+  if (!S.sid) return;
+  const v = k => Math.round(+$('cal' + k).value);
+  const c = {x: v('X'), y: v('Y'), w: v('W'), h: v('H'), frame: S.currentFrame};
+  if (!(c.w >= 8 && c.h >= 8)) return alert('Width and height must be at least 8 px.');
+  S.calib = c; calShow(); renderFrame();
+}
+function calNudge(dx, dy, dw, dh) {
+  if (!S.calib) return alert('Press Auto-fill (or type a box) first.');
+  const c = S.calib;
+  S.calib = {x: c.x + dx, y: c.y + dy, w: Math.max(8, c.w + dw), h: Math.max(8, c.h + dh), frame: S.currentFrame};
+  calShow(); renderFrame();
+}
+function calClear() { S.calib = null; calShow(); renderFrame(); }
 
 // ---- status labels (flywheel / tape / height / laps / rotations) ----
 function setLabels(d) {
@@ -980,7 +1099,7 @@ async function uploadVideo() {
   Object.assign(S, {sid: data.sid, fps: data.fps,
     totalFrames: data.total_frames, origW: data.orig_w, origH: data.orig_h,
     duration: data.duration || data.total_frames / data.fps,
-    currentFrame: 0, history: [], laps: [], cropStart: 0, cropEnd: data.duration,
+    currentFrame: 0, history: [], laps: [], calib: null, cropStart: 0, cropEnd: data.duration,
     startSel: 0, endSel: data.duration});
   $('fileLabel').textContent = data.filename;
   $('cropFileName').textContent = data.filename;
@@ -994,7 +1113,7 @@ async function uploadVideo() {
       `Frame: ${S.currentFrame} / ${S.totalFrames}   Time: ${(S.currentFrame / S.fps).toFixed(2)}s`;
     renderFrame();
   };
-  resetAnalysis();
+  resetAnalysis(); calShow();
   updateCropBadge(); updateCropBar(); updateCropInfo(); renderFrame(); updateFastInfo();
   $('startStrip').dataset.loaded = ''; $('endStrip').dataset.loaded = '';
   if ($('pageCrop').classList.contains('active')) { loadStartWindow(); loadEndWindow(); }
