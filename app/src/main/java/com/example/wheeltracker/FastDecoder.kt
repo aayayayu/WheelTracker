@@ -7,46 +7,37 @@ import android.media.MediaFormat
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 
-/** Width (px) of the optional live-preview picture. */
-private const val PREVIEW_W = 640
-
 /**
- * One decoded frame: the luma (grayscale) values of the tracking box, in the video's raw orientation.
- * pdata (may be null) is a down-scaled luma picture of the WHOLE frame (pw x ph, same raw orientation),
- * only filled in now and then when a live preview was requested.
+ * One decoded frame: the WHOLE frame, sub-sampled by `step` in both directions (nearest pixel) and
+ * converted to interleaved BGR (w * h * 3 bytes, row-major), in the video's raw orientation.
+ * Python rotates it to the displayed orientation with [rotation].
+ *
+ * The side-view flywheel detector needs colour (blue bracket, gray wheel, wall brightness), which is
+ * why this is no longer just the luma of a tracking box.
  */
 class FdFrame(
     @JvmField val idx: Int,
     @JvmField val w: Int,
     @JvmField val h: Int,
-    @JvmField val full: Boolean,
     @JvmField val rotation: Int,
     @JvmField val data: ByteArray,
-    @JvmField val pw: Int = 0,
-    @JvmField val ph: Int = 0,
-    @JvmField val pdata: ByteArray? = null,
 )
 
 /**
  * Decodes frames [startFrame, endFrame) with the phone's hardware decoder on a background thread
- * and queues only the luma of the tracking box (given in *displayed* coordinates).
- * Python polls it with poll() until isDone().
+ * and queues them as sub-sampled BGR pictures. Python polls it with poll() until isDone().
  */
 class FdSession(
     private val path: String,
     private val startFrame: Int,
     private val endFrame: Int,
     private val fps: Double,
-    private val dx0: Int, private val dy0: Int, private val dx1: Int, private val dy1: Int,
-    private val previewEvery: Int,   // 0 = no preview pictures
-    private val previewMs: Int,      // at most one preview picture per this many milliseconds
+    private val step: Int,           // keep every step-th pixel in x and y (1 = full resolution)
 ) {
-    private val queue = ArrayBlockingQueue<FdFrame>(32)
+    private val queue = ArrayBlockingQueue<FdFrame>(16)
     @Volatile private var finished = false
     @Volatile private var stopFlag = false
     @Volatile private var err: String? = null
-    private var havePreview = false
-    private var lastPreviewNs = 0L
 
     private val worker = Thread { run() }.apply { isDaemon = true; start() }
 
@@ -62,18 +53,24 @@ class FdSession(
         return false
     }
 
-    /** Displayed-orientation box -> raw (unrotated) box, clamped. Returns [x0, y0, x1, y1]. */
-    private fun rawRect(rw: Int, rh: Int, rotation: Int): IntArray {
-        val dispW = if (rotation == 90 || rotation == 270) rh else rw
-        val dispH = if (rotation == 90 || rotation == 270) rw else rh
-        val ax0 = dx0.coerceIn(0, dispW); val ax1 = dx1.coerceIn(0, dispW)
-        val ay0 = dy0.coerceIn(0, dispH); val ay1 = dy1.coerceIn(0, dispH)
-        return when (rotation) {
-            90 -> intArrayOf(ay0, rh - ax1, ay1, rh - ax0)
-            180 -> intArrayOf(rw - ax1, rh - ay1, rw - ax0, rh - ay0)
-            270 -> intArrayOf(rw - ay1, ax0, rw - ay0, ax1)
-            else -> intArrayOf(ax0, ay0, ax1, ay1)
+    /** Colour conversion constants (x256), chosen from the stream's range / colour standard. */
+    private class Yuv(val off: Int, val cy: Int, val crv: Int, val cgu: Int, val cgv: Int, val cbu: Int)
+
+    private fun yuvFor(fullRange: Boolean, bt709: Boolean): Yuv = when {
+        !fullRange && bt709 -> Yuv(16, 298, 459, 55, 136, 541)
+        !fullRange -> Yuv(16, 298, 409, 100, 208, 516)
+        bt709 -> Yuv(0, 256, 403, 48, 120, 475)
+        else -> Yuv(0, 256, 359, 88, 183, 454)
+    }
+
+    private fun isBt709(fmt: MediaFormat, rawLongSide: Int): Boolean {
+        if (fmt.containsKey(MediaFormat.KEY_COLOR_STANDARD)) {
+            return when (fmt.getInteger(MediaFormat.KEY_COLOR_STANDARD)) {
+                MediaFormat.COLOR_STANDARD_BT601_PAL, MediaFormat.COLOR_STANDARD_BT601_NTSC -> false
+                else -> true
+            }
         }
+        return rawLongSide >= 1280          // no information: HD and larger is BT.709
     }
 
     private fun run() {
@@ -96,6 +93,11 @@ class FdSession(
                 ((fmt.getInteger(MediaFormat.KEY_ROTATION) % 360) + 360) % 360 else 0
             var fullRange = fmt.containsKey(MediaFormat.KEY_COLOR_RANGE) &&
                 fmt.getInteger(MediaFormat.KEY_COLOR_RANGE) == MediaFormat.COLOR_RANGE_FULL
+            val longSide = maxOf(
+                if (fmt.containsKey(MediaFormat.KEY_WIDTH)) fmt.getInteger(MediaFormat.KEY_WIDTH) else 0,
+                if (fmt.containsKey(MediaFormat.KEY_HEIGHT)) fmt.getInteger(MediaFormat.KEY_HEIGHT) else 0
+            )
+            var bt709 = isBt709(fmt, longSide)
 
             // presentation time of the first frame (usually 0)
             ex.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
@@ -117,9 +119,6 @@ class FdSession(
             val info = MediaCodec.BufferInfo()
             var inputDone = false
             var outputDone = false
-            var rect: IntArray? = null
-            var rectW = -1
-            var rectH = -1
 
             while (!outputDone && !stopFlag) {
                 if (!inputDone) {
@@ -144,17 +143,8 @@ class FdSession(
                     if (idx >= endFrame) {
                         outputDone = true
                     } else if (idx >= startFrame && info.size > 0) {
-                        val nowNs = System.nanoTime()
-                        val wantPrev = previewEvery > 0 &&
-                            (idx - startFrame) % previewEvery == 0 &&
-                            (!havePreview || nowNs - lastPreviewNs >= previewMs * 1_000_000L)
-                        val frame = extract(c, oi, info, idx, rotation, fullRange,
-                            rect, rectW, rectH, wantPrev)
-                        if (frame != null) {
-                            if (frame.first.pdata != null) { havePreview = true; lastPreviewNs = nowNs }
-                            rect = frame.second; rectW = frame.third; rectH = frame.fourth
-                            if (!offer(frame.first)) outputDone = true
-                        }
+                        val frame = extract(c, oi, idx, rotation, yuvFor(fullRange, bt709))
+                        if (!offer(frame)) outputDone = true
                     }
                     c.releaseOutputBuffer(oi, false)
                     if (eos) outputDone = true
@@ -164,7 +154,9 @@ class FdSession(
                         fullRange = of.getInteger(MediaFormat.KEY_COLOR_RANGE) ==
                             MediaFormat.COLOR_RANGE_FULL
                     }
-                    rect = null
+                    if (of.containsKey(MediaFormat.KEY_COLOR_STANDARD)) {
+                        bt709 = isBt709(of, longSide)
+                    }
                 }
             }
         } catch (t: Throwable) {
@@ -177,118 +169,67 @@ class FdSession(
         }
     }
 
-    private class Quad<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
+    private fun clamp(v: Int): Int = if (v < 0) 0 else if (v > 255) 255 else v
 
-    /** Copies the luma of the tracking box out of one decoder output buffer. */
-    private fun extract(
-        c: MediaCodec, oi: Int, info: MediaCodec.BufferInfo, idx: Int, rotation: Int,
-        fullRange: Boolean, cachedRect: IntArray?, cachedW: Int, cachedH: Int,
-        wantPrev: Boolean,
-    ): Quad<FdFrame, IntArray, Int, Int>? {
-        val img = try { c.getOutputImage(oi) } catch (_: Throwable) { null }
-        if (img != null) {
-            try {
-                val crop = img.cropRect
-                val rw = crop.width()
-                val rh = crop.height()
-                val r = if (cachedRect != null && cachedW == rw && cachedH == rh) cachedRect
-                        else rawRect(rw, rh, rotation)
-                val cw = r[2] - r[0]
-                val ch = r[3] - r[1]
-                if (cw <= 0 || ch <= 0) return null
-                val plane = img.planes[0]
-                val bb = plane.buffer
-                val rs = plane.rowStride
-                val ps = plane.pixelStride
-                val out = ByteArray(cw * ch)
-                for (row in 0 until ch) {
-                    val base = (crop.top + r[1] + row) * rs + (crop.left + r[0]) * ps
-                    if (ps == 1) {
-                        bb.position(base)
-                        bb.get(out, row * cw, cw)
-                    } else {
-                        // e.g. 16-bit (10-bit HDR) luma: keep the high byte
-                        for (col in 0 until cw) out[row * cw + col] = bb.get(base + col * ps + (ps - 1))
-                    }
+    /** Reads one decoder output picture, sub-samples it by `step` and converts it to BGR. */
+    private fun extract(c: MediaCodec, oi: Int, idx: Int, rotation: Int, k: Yuv): FdFrame {
+        val img = c.getOutputImage(oi)
+            ?: throw IllegalStateException("decoder gives no Image output")
+        try {
+            val crop = img.cropRect
+            val rw = crop.width()
+            val rh = crop.height()
+            val ow = rw / step
+            val oh = rh / step
+            if (ow <= 0 || oh <= 0) throw IllegalStateException("empty frame")
+
+            val yP = img.planes[0]
+            val uP = img.planes[1]
+            val vP = img.planes[2]
+            val yb = yP.buffer
+            val ub = uP.buffer
+            val vb = vP.buffer
+            val yrs = yP.rowStride
+            val yps = yP.pixelStride
+            val urs = uP.rowStride
+            val ups = uP.pixelStride
+            val vrs = vP.rowStride
+            val vps = vP.pixelStride
+            // 16-bit (10-bit HDR) samples: keep the high byte
+            val hi = if (yps > 1) 1 else 0
+
+            val out = ByteArray(ow * oh * 3)
+            var o = 0
+            for (row in 0 until oh) {
+                val sy = crop.top + row * step
+                val yRow = sy * yrs
+                val cRowU = (sy shr 1) * urs
+                val cRowV = (sy shr 1) * vrs
+                for (col in 0 until ow) {
+                    val sx = crop.left + col * step
+                    val y = yb.get(yRow + sx * yps + hi).toInt() and 0xFF
+                    val u = (ub.get(cRowU + (sx shr 1) * ups + hi).toInt() and 0xFF) - 128
+                    val v = (vb.get(cRowV + (sx shr 1) * vps + hi).toInt() and 0xFF) - 128
+                    val yy = (y - k.off) * k.cy
+                    out[o] = clamp((yy + k.cbu * u) shr 8).toByte()                  // B
+                    out[o + 1] = clamp((yy - k.cgu * u - k.cgv * v) shr 8).toByte()  // G
+                    out[o + 2] = clamp((yy + k.crv * v) shr 8).toByte()              // R
+                    o += 3
                 }
-                var pw = 0
-                var ph = 0
-                var pd: ByteArray? = null
-                if (wantPrev) {
-                    try {
-                        val step = maxOf(1, (rw + PREVIEW_W - 1) / PREVIEW_W)
-                        val w2 = rw / step
-                        val h2 = rh / step
-                        if (w2 > 0 && h2 > 0) {
-                            val tmp = ByteArray(w2 * h2)
-                            for (row in 0 until h2) {
-                                val rb = (crop.top + row * step) * rs + crop.left * ps
-                                for (col in 0 until w2) tmp[row * w2 + col] = bb.get(rb + col * step * ps + (ps - 1))
-                            }
-                            pd = tmp; pw = w2; ph = h2
-                        }
-                    } catch (_: Throwable) { pd = null; pw = 0; ph = 0 }
-                }
-                return Quad(FdFrame(idx, cw, ch, fullRange, rotation, out, pw, ph, pd), r, rw, rh)
-            } finally {
-                img.close()
             }
+            return FdFrame(idx, ow, oh, rotation, out)
+        } finally {
+            img.close()
         }
-
-        // Fallback: raw byte buffer (Y plane first, then chroma)
-        val of = c.outputFormat
-        val w0 = of.getInteger(MediaFormat.KEY_WIDTH)
-        val h0 = of.getInteger(MediaFormat.KEY_HEIGHT)
-        val cl = if (of.containsKey("crop-left")) of.getInteger("crop-left") else 0
-        val ct = if (of.containsKey("crop-top")) of.getInteger("crop-top") else 0
-        val cr = if (of.containsKey("crop-right")) of.getInteger("crop-right") else w0 - 1
-        val cb = if (of.containsKey("crop-bottom")) of.getInteger("crop-bottom") else h0 - 1
-        val rw = cr - cl + 1
-        val rh = cb - ct + 1
-        val rs = if (of.containsKey("stride")) of.getInteger("stride") else w0
-        val ob = c.getOutputBuffer(oi) ?: return null
-        val r = if (cachedRect != null && cachedW == rw && cachedH == rh) cachedRect
-                else rawRect(rw, rh, rotation)
-        val cw = r[2] - r[0]
-        val ch = r[3] - r[1]
-        if (cw <= 0 || ch <= 0) return null
-        val out = ByteArray(cw * ch)
-        for (row in 0 until ch) {
-            ob.position(info.offset + (ct + r[1] + row) * rs + cl + r[0])
-            ob.get(out, row * cw, cw)
-        }
-        var pw = 0
-        var ph = 0
-        var pd: ByteArray? = null
-        if (wantPrev) {
-            try {
-                val step = maxOf(1, (rw + PREVIEW_W - 1) / PREVIEW_W)
-                val w2 = rw / step
-                val h2 = rh / step
-                if (w2 > 0 && h2 > 0) {
-                    val tmp = ByteArray(w2 * h2)
-                    for (row in 0 until h2) {
-                        val rb = info.offset + (ct + row * step) * rs + cl
-                        for (col in 0 until w2) tmp[row * w2 + col] = ob.get(rb + col * step)
-                    }
-                    pd = tmp; pw = w2; ph = h2
-                }
-            } catch (_: Throwable) { pd = null; pw = 0; ph = 0 }
-        }
-        return Quad(FdFrame(idx, cw, ch, fullRange, rotation, out, pw, ph, pd), r, rw, rh)
     }
 }
 
 object FastDecoder {
     /**
-     * Starts decoding [startFrame, endFrame); the box is x0,y0,x1,y1 in displayed pixels.
-     * previewEvery > 0 also attaches a small whole-frame luma picture to every previewEvery-th
-     * frame, but at most one per previewMs milliseconds.
+     * Starts decoding [startFrame, endFrame). Every frame is delivered whole, sub-sampled by `step`
+     * (1 = full resolution) and converted to BGR.
      */
     @JvmStatic
-    fun open(
-        path: String, startFrame: Int, endFrame: Int, fps: Double,
-        x0: Int, y0: Int, x1: Int, y1: Int,
-        previewEvery: Int, previewMs: Int,
-    ): FdSession = FdSession(path, startFrame, endFrame, fps, x0, y0, x1, y1, previewEvery, previewMs)
+    fun open(path: String, startFrame: Int, endFrame: Int, fps: Double, step: Int): FdSession =
+        FdSession(path, startFrame, endFrame, fps, maxOf(1, step))
 }

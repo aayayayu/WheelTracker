@@ -4,8 +4,9 @@ Android entry point. Keeps app.py (the Flask app) almost untouched and patches i
     No conversion / transcoding step: loading a video is instant. Used for single frames only
     (slider, thumbnails); app.py keeps ONE retriever open per video instead of one per request.
  2. ALL analysis (normal, live preview and parallel) uses the phone's hardware video decoder
-    (FastDecoder.kt) and reads only the tracking box (luma plane); the live preview picture is a
-    down-scaled luma frame taken from the same decoder pass, so it costs no extra decoding.
+    (FastDecoder.kt). The flywheel detector needs colour, so every frame arrives whole, sub-sampled
+    to about DETECT_W pixels wide and converted to BGR. The live preview is drawn on that same frame,
+    so it costs no extra decoding.
  3. Mobile-friendly CSS / viewport, and CSV export through the native bridge.
 """
 import os, tempfile, time
@@ -146,9 +147,6 @@ cv2.VideoCapture = _video_capture
 
 
 # ---------------- hardware-decoder range reader ----------------
-_LIMITED_LUT = np.clip((np.arange(256) - 16) * 255.0 / 219.0, 0, 255).astype(np.uint8)
-
-
 def _to_np(jarr):
     """Java byte[] -> uint8 numpy array."""
     try:
@@ -157,28 +155,20 @@ def _to_np(jarr):
         return np.array(jarr, dtype=np.int8).view(np.uint8)  # slow but always works
 
 
-def _to_gray(f, data=None, w=None, h=None):
-    a = _to_np(f.data if data is None else data).reshape(f.h if h is None else h,
-                                                          f.w if w is None else w)
-    if not f.full:                      # limited-range luma (16..235) -> full 0..255
-        a = cv2.LUT(a, _LIMITED_LUT)
-    k = (4 - int(f.rotation) // 90) % 4  # raw frame -> displayed orientation
+def _to_bgr(f):
+    """FdFrame (raw orientation, BGR bytes) -> displayed-orientation BGR array."""
+    a = _to_np(f.data).reshape(f.h, f.w, 3)
+    k = (4 - int(f.rotation) // 90) % 4                    # raw frame -> displayed orientation
     if k:
         a = np.ascontiguousarray(np.rot90(a, k))
     return a
 
 
-PREVIEW_MS = 300        # the decoder makes at most one preview picture per this many ms
-
-
-def hw_range_reader(sess, sf, ef, rect, preview_every=0, preview_ms=PREVIEW_MS):
-    """Yield (frame_index, gray ROI, preview) for frames [sf, ef) using MediaCodec.
-    preview is None, or (down-scaled gray full frame, scale vs. the original frame)."""
+def hw_range_reader(sess, sf, ef):
+    """Yield (frame_index, BGR frame sub-sampled by sess['step']) for frames [sf, ef) using MediaCodec."""
     from java import jclass
     FD = jclass("com.example.wheeltracker.FastDecoder")
-    x0, y0, x1, y1 = rect
-    s = FD.open(sess['video_path'], int(sf), int(ef), float(sess['fps']),
-                int(x0), int(y0), int(x1), int(y1), int(preview_every), int(preview_ms))
+    s = FD.open(sess['video_path'], int(sf), int(ef), float(sess['fps']), int(sess['step']))
     n = 0
     try:
         while True:
@@ -189,11 +179,7 @@ def hw_range_reader(sess, sf, ef, rect, preview_every=0, preview_ms=PREVIEW_MS):
                 time.sleep(0.001)
                 continue
             n += 1
-            pv = None
-            if f.pdata is not None:
-                img = _to_gray(f, f.pdata, f.pw, f.ph)
-                pv = (img, img.shape[1] / float(sess['orig_w'] or img.shape[1]))
-            yield int(f.idx), _to_gray(f), pv
+            yield int(f.idx), _to_bgr(f)
         err = s.errorMessage()
         if err:
             raise RuntimeError(err)

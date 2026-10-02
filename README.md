@@ -8,8 +8,9 @@ Runs your Flask + OpenCV app fully on-device. Nothing is uploaded anywhere.
    Or Build > Build APK(s) and install app/build/outputs/apk/debug/app-debug.apk.
 
 ## Performance notes
-- All analysis (normal, live preview, parallel) uses the hardware decoder and reads only the tracking box.
-  The live preview is a small grayscale picture taken from that same pass, so it costs almost nothing.
+- All analysis (normal, live preview, parallel) uses the hardware decoder (FastDecoder.kt). The flywheel
+  detector needs colour, so every frame is delivered whole, sub-sampled to about 960 px wide and converted
+  to BGR. The live preview is drawn on that same frame, so it costs no extra decoding.
 - The frame slider keeps one decoder open per video, caches the last frames, and only sends one
   request at a time. Logcat (tag `python`) prints `RENDER frame N: decode X ms` so you can see the raw decode cost.
 - Only the currently loaded video is kept in the app cache. Older copies are deleted on upload,
@@ -20,26 +21,39 @@ The GitHub Action builds the debug APK and publishes it as `Flywheel.apk` (artif
 
 ## Algorithm (wheel_algo.py)
 
-The tracker was replaced by the side-on tape tracker from `flywheel_rotation_counter.py`.
-The UI, the hardware decoder (FastDecoder.kt), time crop, parallel mode and CSV export are unchanged.
+`wheel_algo.py` is a port of `flywheel_rotations.py` (side view, one black tape on the rim). Nothing has to
+be marked on the video any more: there is no tracking box, no black limit and no blob-area setting.
 
-1. The **tracking box** (Top / Bottom / Left / Right) only has to surround the wheel. Inside it the
-   wheel is found automatically in every frame (grey pixels darker than the wall), giving a wheel box.
-2. The **tape** is the longest run of dark rows inside the wheel (`Black Limit`).
-3. Tape height on the rim gives its angle: `sin(theta) = (y_tape - y_centre) / R`.
-4. Every separate appearance of the tape is one more turn; the hidden half of each turn is
-   interpolated, so the result is a fractional number of rotations (e.g. 6.13).
-5. Only the grayscale tracking box is used, and only ~one row profile per frame is kept in memory.
+1. **Flywheel box, every frame.** The wheel is the gray vertical block (low saturation, darker than the
+   wall) that crosses the blue bracket. If it is not found in a frame, the last known box is reused (the
+   first known box for the frames before the first detection).
+2. **Brightness profile.** Inside the box a 200-point vertical brightness profile is taken (middle 60 % of
+   the width) and divided by its own smoothed baseline.
+3. **Tape = what moves.** Every profile is divided by the *median profile over the whole video*, so the
+   static parts (rod, shaft, edges) cancel and only the moving black tape is left, as a dark band
+   (profile < `Dark threshold`, default 0.70).
+4. **Phase.** Tape height y in [0, 1] gives the angle `asin(2y - 1)`. A new lap starts when y jumps back up
+   by more than `New-lap jump` (default 0.30). The angle is unwrapped (never goes backwards), interpolated
+   while the tape is behind the wheel, and extrapolated after the last sighting with the latest lap period.
+5. **rotations = (final phase - first phase) / 360.**
 
-How the existing controls are used now:
+Because step 3 needs the whole video, the exact result is computed when the run has finished. While the live
+preview runs, a causal estimate (median of the frames seen so far) is shown instead.
+
+### Controls
 
 | Control | Meaning |
 |---|---|
-| Black Limit | row brightness below this = tape |
-| Min / Max blob area | allowed tape band area (px); 0 = unlimited |
-| Debounce frames | a tape pass must be seen in at least this many frames (rejects glare/noise) |
-| Tape motion | direction the tape moves across the visible rim |
-| Strict sequence mode | ignore passes where the tape moved the wrong way |
+| Dark threshold | tape = profile below this fraction of its usual brightness |
+| New-lap jump | tape moving back up by more than this fraction of the wheel height = new lap |
+| Time Crop / Parallel / FPS cap / live preview | unchanged |
 
-Assumptions: side-on camera, one dark tape on the rim, wheel does not reverse, wall brighter than the
-wheel, and the wheel turns less than half a turn between frames.
+The result shows what `flywheel_rotations.py` prints (frames, fps, flywheel missed, lap start frames, lap
+periods, rotations from tape sightings, rotations including the estimate to the end), a lap table, a plot, and
+the per-frame CSV (frame, time, flywheel detected/held, tape found/hidden, tape height, phase, rotations).
+After a run the frame slider shows the same annotation as the annotated video of the Python script: flywheel
+box (green = detected, orange = held), red line at the tape, dial, rotation counter.
+
+Assumptions: side-on camera, one dark tape on the rim, a blue bracket crossing the wheel, wheel does not
+reverse, and the wheel turns less than half a turn between frames. Detection runs on frames sub-sampled to
+about 960 px wide (pixel thresholds of the script are scaled accordingly).

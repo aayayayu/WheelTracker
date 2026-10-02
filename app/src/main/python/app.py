@@ -1,7 +1,8 @@
 """
 EP LAB - Flywheel — Flask Web Edition
+Side-view flywheel with one black tape on the rim. Algorithm: wheel_algo.py (port of flywheel_rotations.py).
 """
-import os, io, re, csv, math, base64, uuid, shutil, collections, json as _json, tempfile, threading, time
+import os, io, re, math, base64, uuid, shutil, collections, json as _json, tempfile, threading, time
 from urllib.parse import unquote
 import numpy as np, cv2, matplotlib
 import wheel_algo as wa
@@ -12,39 +13,16 @@ from flask import Flask, request, jsonify, Response
 app = Flask(__name__)
 app.secret_key = 'rw-tracker-secret-key'
 SESSIONS, DISPLAY_MAX_W = {}, 900
+PREVIEW_MS = 300            # uncapped live preview: at most one picture per this many ms
+DETECT_W = 960              # frames are analysed sub-sampled to about this width (px)
+FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
-# ---------- CV ----------
-def process_frame(frame, p):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, p['black_thresh'], 255, cv2.THRESH_BINARY_INV)
-    yt, yb, xl, xr = p['y_top'], p['y_bottom'], p['x_left'], p['x_right']
-    res = {'found': False, 'mask': mask, 'y': None, 'state': 'hidden', 'area': 0, 'rect': None}
-    if None in (yt, yb, xl, xr): return res
-    y0, y1, x0, x1 = min(yt, yb), max(yt, yb), min(xl, xr), max(xl, xr)
-    roi = np.zeros_like(mask)
-    roi[y0:y1, x0:x1] = mask[y0:y1, x0:x1]
-    mask = roi
-    k = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
-    res['mask'] = mask
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cands = []
-    for c in cnts:
-        a = cv2.contourArea(c)
-        if a < p['min_area'] or (p['max_area'] > 0 and a > p['max_area']): continue
-        x, y, w, h = cv2.boundingRect(c)
-        cands.append({'area': a, 'cy': y + h / 2.0, 'rect': (x, y, w, h)})
-    if not cands: return res
-    ch = max(cands, key=lambda c: c['area'])
-    span = (yb - yt) or 1
-    ny = (ch['cy'] - yt) / span
-    state = 'top' if ny < 0.33 else ('mid' if ny < 0.66 else 'bottom')
-    res.update(found=True, y=ch['cy'], state=state, area=ch['area'], rect=ch['rect'])
-    return res
+class UserError(Exception):
+    """A problem with the video / settings (not a decoder failure): shown to the user as is."""
 
 
+# ---------- Drawing ----------
 def fit_display(frame, max_w=DISPLAY_MAX_W):
     """Return (picture no wider than max_w, scale vs. the original). Always a NEW array,
     because decoded frames are shared with the frame cache and must never be drawn on."""
@@ -55,32 +33,39 @@ def fit_display(frame, max_w=DISPLAY_MAX_W):
     return frame.copy(), 1.0
 
 
-def draw_overlay(out, res, p, s, rot=None):
-    """Draw boundary lines / wheel box / tape box / state text IN PLACE on `out`, which is `s` times
-    the size of the original frame (boundaries and detections are in original coordinates).
-    Drawing after down-scaling is ~5x cheaper than drawing on the full frame."""
+def draw_overlay(out, s, box, detected, tape_y=None, tape_state=None, phase=None, rot=None,
+                 laps=None, t=None):
+    """Annotate `out` (the frame scaled by s) like the annotated video of flywheel_rotations.py:
+    flywheel box (green = detected, orange = held), red line at the tape, a dial with the tape
+    phase, and the rotation counter. box = (x, y, w, h) in ORIGINAL pixels or None;
+    tape_y in [0, 1] of the box height; tape_state 'found' | 'hidden' | None."""
     H, W = out.shape[:2]
-    th = max(1, int(round(2 * s)))
-    sc = lambda v: int(round(v * s))
-    for y in (p.get('y_top'), p.get('y_bottom')):
-        if y is not None: cv2.line(out, (0, sc(y)), (W, sc(y)), (255, 0, 0), th)
-    for x in (p.get('x_left'), p.get('x_right')):
-        if x is not None: cv2.line(out, (sc(x), 0), (sc(x), H), (0, 255, 0), th)
-    wh = res.get('wheel')
-    if wh:                                           # wheel found automatically inside the tracking box
-        cv2.rectangle(out, (sc(wh[0]), sc(wh[1])), (sc(wh[2]), sc(wh[3])), (255, 200, 0), max(1, th // 2))
-    if res['found']:
-        x, y, w, h = res['rect']
-        cv2.rectangle(out, (sc(x), sc(y)), (sc(x + w), sc(y + h)), (0, 0, 255), th)
-        txt, col = f"STATE: {res['state'].upper()} | Y: {int(res['y'])}", (0, 255, 255)
+    if box is not None:
+        x, y, w, h = [int(round(float(v) * s)) for v in box]
+        col = (0, 200, 0) if detected else (0, 165, 255)
+        cv2.rectangle(out, (x, y), (x + w, y + h), col, 2)
+        label = "flywheel: " + ("detected" if detected else "held (last known)")
     else:
-        txt, col = "Tape HIDDEN (back side)", (0, 0, 255)
-    fs = max(0.42, 0.55 * s)                       # small text: it must not cover the wheel
-    tk = max(1, int(round(1.5 * s)))
-    lh = int(12 + 16 * fs)                         # line height
-    cv2.putText(out, txt, (8, lh), cv2.FONT_HERSHEY_SIMPLEX, fs, col, tk)
+        col, label = (0, 0, 255), "flywheel: not found"
+    cv2.putText(out, label, (8, 22), FONT, 0.55, col, 2)
+    if tape_state == 'found' and box is not None and tape_y is not None:
+        ty = int(y + tape_y * h)
+        cv2.line(out, (x, ty), (x + w, ty), (0, 0, 255), 3)
+        cv2.putText(out, "tape: found", (8, 44), FONT, 0.55, (0, 0, 255), 2)
+    elif tape_state == 'hidden':
+        cv2.putText(out, "tape: behind wheel (phase estimated)", (8, 44), FONT, 0.55, (255, 160, 0), 2)
+    if phase is not None:                                  # small dial: tape position around the wheel
+        cx, cy, r = W - 60, H - 70, 40
+        cv2.circle(out, (cx, cy), r, (255, 255, 255), -1)
+        cv2.circle(out, (cx, cy), r, (60, 60, 60), 2)
+        a = math.radians(phase)
+        cv2.circle(out, (cx + int(r * .8 * math.cos(a)), cy + int(r * .8 * math.sin(a))), 6,
+                   (0, 0, 255) if tape_state == 'found' else (255, 160, 0), -1)
     if rot is not None:
-        cv2.putText(out, f"Rot.: {float(rot):.2f}", (8, 2 * lh), cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 255, 0), tk)
+        cv2.rectangle(out, (0, H - 62), (250, H), (0, 0, 0), -1)
+        cv2.putText(out, "Rotations: %.2f" % rot, (8, H - 36), FONT, 0.75, (255, 255, 255), 2)
+        cv2.putText(out, "full laps seen: %d  t=%.2fs" % (laps or 0, t or 0.0),
+                    (8, H - 10), FONT, 0.5, (200, 200, 200), 1)
     return out
 
 
@@ -93,14 +78,12 @@ def encode_jpeg(bgr, max_w=DISPLAY_MAX_W, quality=80):
 
 
 def extract_params(d):
-    return {k: d.get(k) for k in ('y_top', 'y_bottom', 'x_left', 'x_right')} | {
-        'black_thresh': int(d.get('black_thresh', 60)),
-        'min_area': int(d.get('min_area', 100)),
-        'max_area': int(d.get('max_area', 0)),
-        'debounce': int(d.get('debounce', 2)),
-        'direction': d.get('direction', 'down'),
-        'strict': bool(d.get('strict', False)),
-    }
+    def num(key, default, lo, hi):
+        try: v = float(d.get(key, default))
+        except (TypeError, ValueError): v = default
+        return min(hi, max(lo, v))
+    return {'dark_thr': num('dark_thr', wa.DARK_THR, 0.30, 0.95),
+            'new_lap_jump': num('new_lap_jump', wa.NEW_LAP_JUMP, 0.10, 0.90)}
 
 
 # ---------- Video storage / frame access ----------
@@ -140,8 +123,8 @@ def drop_all():
 
 class FrameSource:
     """One persistent decoder per video (opening a decoder for every request is very slow on
-    Android) plus a tiny LRU of decoded frames, so re-rendering the same frame after a threshold /
-    boundary change costs no decoding at all. Cached frames are shared: never modify them."""
+    Android) plus a tiny LRU of decoded frames, so re-rendering the same frame costs no decoding at
+    all. Cached frames are shared: never modify them."""
 
     def __init__(self, path, keep=2):
         self.path, self.keep = path, keep
@@ -213,84 +196,66 @@ class FrameSource:
                 self.cap = None
 
 
-_K5 = np.ones((5, 5), np.uint8)
+# ---------- Final result ----------
+def finish_event(sol, fps, p, sf, ef, extra, sess):
+    """Build the final 'done' event from wheel_algo.solve() output and keep what the frame viewer
+    needs (box / tape / phase per frame) in the session."""
+    n, idx, phase = sol['n'], sol['idx'], sol['phase']
+    ph0 = float(phase[0])
+    rot = (phase - ph0) / 360.0
+    entries, seen = sol['entries'], sol['seen']
+    lap_frames = [int(idx[e]) for e in entries]
+    lap_periods = [float(idx[b] - idx[a]) / fps for a, b in zip(entries, entries[1:])] if fps > 0 else []
 
-
-def _empty_res():
-    return {'found': False, 'mask': None, 'y': None, 'state': 'hidden', 'area': 0, 'rect': None, 'wheel': None}
-
-
-def roi_rect(p, W, H):
-    """Tracking box (x0, y0, x1, y1) clamped to the frame, or None if not usable."""
-    yt, yb, xl, xr = p['y_top'], p['y_bottom'], p['x_left'], p['x_right']
-    if None in (yt, yb, xl, xr): return None
-    y0, y1 = max(0, min(yt, yb)), min(H, max(yt, yb))
-    x0, x1 = max(0, min(xl, xr)), min(W, max(xl, xr))
-    if y1 <= y0 or x1 <= x0: return None
-    return x0, y0, x1, y1
-
-
-def detect_rec(gray, x0, y0, p):
-    """Measure one already-cropped grayscale tracking box whose top-left corner is (x0, y0) in the
-    full frame. Returns (raw single-frame result in full-frame coordinates, light record that
-    wheel_algo.solve() needs later)."""
-    rec = wa.measure_frame(gray)
-    return wa.frame_result(rec, x0, y0, p), rec
-
-
-def detect_gray(gray, x0, y0, p):
-    return detect_rec(gray, x0, y0, p)[0]
-
-
-# ---------- Analysis stream ----------
-def finish_event(sol, frames, ox, oy, fps, p, sf, ef, total, extra=()):
-    """Build the final 'done' event from wheel_algo.solve() output. `frames` = frame index per record."""
-    n, rot, theta, tot = sol['n'], sol['rot'], sol['theta'], sol['total']
-    ks = sol['known']
-    total_time = n / fps if fps > 0 else 0.0
-    L = [f"Frames processed: {n}", f"Video duration processed: {total_time:.2f} s"]
-    L += list(extra)
-    L.append(f"Tape passes detected: {len(sol['passes'])}"
-             + (f" (ignored {sol['n_groups'] - len(sol['passes'])} short/invalid)" if sol['n_groups'] > len(sol['passes']) else ""))
-    L.append(f"Total rotations: {tot:.2f}   (full rotations: {int(math.floor(tot + 1e-9))})")
-    if ks and fps > 0 and rot[ks[-1]] - rot[ks[0]] > 0.05:
-        per = ((ks[-1] - ks[0]) / fps) / (rot[ks[-1]] - rot[ks[0]])
+    L = [f"frames: {n}  fps: {fps:.2f}  flywheel missed: {sol['missed']}",
+         f"lap start frames: {lap_frames}",
+         f"lap periods (s): {[round(x, 2) for x in lap_periods]}",
+         f"rotations (from tape sightings): {sol['seen_only']:.2f}",
+         f"rotations (incl. estimate to end): {sol['total']:.2f}"]
+    L.append(f"full rotations: {int(math.floor(sol['total'] + 1e-9))}")
+    if fps > 0 and sol['seen_only'] > 0.05:
+        per = (float(idx[seen[-1]] - idx[seen[0]]) / fps) / sol['seen_only']
         w = 2 * math.pi / per
-        L += [f"Average period per rotation: {per:.4f} s",
-              f"Average angular velocity: {w:.4f} rad/s ({w * 60 / (2 * math.pi):.2f} RPM)"]
-    elif not ks:
-        L.append("The tape was never found - check the tracking box and the Black Limit.")
+        L += [f"average period per rotation: {per:.4f} s",
+              f"average angular velocity: {w:.4f} rad/s ({w * 60 / (2 * math.pi):.2f} RPM)"]
+    L += list(extra)
     summary = "\n".join(L)
 
     hist = []
     for k in range(n):
-        t = sol['tapes'][k]
-        if t is not None:
-            yc = (t[0] + t[1]) / 2.0
-            state, ypos = wa.state_of(yc, sol['top'][k], sol['bot'][k]), oy + yc
-        else:
-            state, ypos = 'hidden', None
-        hist.append({'frame': int(frames[k]), 'time_s': round(frames[k] / fps if fps > 0 else 0.0, 5),
-                     'y_position': ypos, 'unwrapped_angle_deg': round(float(theta[k] - theta[0]), 3),
-                     'state': state, 'stable_state': state, 'rotation_count': round(float(rot[k]), 3)})
+        hist.append({'frame': int(idx[k]), 'time_s': round(float(idx[k]) / fps if fps > 0 else 0.0, 5),
+                     'flywheel': 'detected' if sol['raw_ok'][k] else 'held',
+                     'tape': 'found' if sol['found'][k] else 'hidden',
+                     'tape_y': round(float(sol['y'][k]), 4) if sol['found'][k] else None,
+                     'phase_deg': round(float(phase[k] - ph0), 3),
+                     'rotation_count': round(float(rot[k]), 3)})
+    laps = []
+    for k, e in enumerate(entries):
+        laps.append({'lap': k + 1, 'frame': int(idx[e]), 'time_s': round(float(idx[e]) / fps if fps > 0 else 0.0, 3),
+                     'period_s': round(lap_periods[k], 4) if k < len(lap_periods) else None})
 
-    times = [h['time_s'] for h in hist]
-    seen_t = [hist[i]['time_s'] for i in ks]
-    seen_a = [hist[i]['unwrapped_angle_deg'] for i in ks]
-    fig, (a1, a2) = plt.subplots(2, 1, figsize=(9, 6))
-    if times: a1.plot(times, [h['unwrapped_angle_deg'] for h in hist], '-', lw=1, color='lightsteelblue')
-    if seen_t: a1.plot(seen_t, seen_a, '.', ms=3, color='steelblue')
-    a1.set(xlabel="time (s)", ylabel="cumulative angle (deg)",
-           title="Tape angle vs time (dots = tape visible, line = interpolated)"); a1.grid(alpha=0.3)
-    if times: a2.plot(times, [h['rotation_count'] for h in hist], color='darkorange')
-    a2.set(xlabel="time (s)", ylabel="rotations",
-           title="Cumulative rotations vs time"); a2.grid(alpha=0.3)
+    times = np.array([h['time_s'] for h in hist])
+    fig, (a0, a1, a2) = plt.subplots(3, 1, figsize=(9, 8.5), sharex=True)
+    ys = np.where(sol['found'], sol['y'], np.nan)
+    a0.plot(times, ys, '.', ms=3, color='crimson')
+    for e in entries: a0.axvline(times[e], color='gray', lw=0.6, ls='--')
+    a0.invert_yaxis()
+    a0.set(ylabel="tape height (0 = top)", title="Tape height on the wheel (dashed = new lap)"); a0.grid(alpha=0.3)
+    a1.plot(times, phase - ph0, '-', lw=1, color='lightsteelblue')
+    a1.plot(times[seen], (phase - ph0)[seen], '.', ms=3, color='steelblue')
+    a1.set(ylabel="cumulative angle (deg)",
+           title="Tape angle vs time (dots = tape visible, line = interpolated / estimated)"); a1.grid(alpha=0.3)
+    a2.plot(times, rot, color='darkorange')
+    a2.set(xlabel="time (s)", ylabel="rotations", title="Cumulative rotations vs time"); a2.grid(alpha=0.3)
     fig.tight_layout()
     buf = io.BytesIO(); fig.savefig(buf, format='png', dpi=90, bbox_inches='tight')
     plt.close(fig); buf.seek(0)
     plot = 'data:image/png;base64,' + base64.b64encode(buf.read()).decode()
 
-    return {'done': True, 'summary': summary, 'rotation_count': round(tot, 2),
+    sess['result'] = {'idx': idx, 'raw_ok': sol['raw_ok'], 'box': sol['box'], 'found': sol['found'],
+                      'y': sol['y'], 'phase': phase, 'entries': np.array(entries, dtype=np.int64)}
+    return {'done': True, 'summary': summary, 'rotation_count': round(sol['total'], 2),
+            'rotations_seen': round(sol['seen_only'], 2), 'laps': laps,
             'history': hist, 'plot': plot, 'start_frame': sf, 'end_frame': ef}
 
 
@@ -301,35 +266,43 @@ def _frame_range(sess, t0, t1):
     return fps, total, sf, ef
 
 
+def _feed(ext, i, bgr):
+    try: return ext.feed(i, bgr)
+    except RuntimeError as e: raise UserError(str(e))
+
+
+def _solve(exts, p):
+    try:
+        idx, raw, box, prof = wa.merge_extractors(exts)
+        return wa.solve(idx, raw, box, prof, p)
+    except RuntimeError as e:
+        raise UserError(str(e))
+
+
+# ---------- Analysis stream ----------
 def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=0):
-    """Sequential analysis with an optional live preview. It uses the SAME fast reader as the
-    parallel mode (RANGE_READER: only the tracking box is decoded); the preview picture comes
-    from the reader itself, so it costs no extra decoding.
+    """Sequential analysis with an optional live preview (annotated frames with a running estimate;
+    the exact result comes from the final solve). The hardware decoder delivers full colour frames
+    (RANGE_READER); the preview is made from the very same frame, so it costs no extra decoding.
     fps_cap > 0 (live mode only) paces the analysis to at most that many frames per second and shows
     EVERY processed frame, each stamped with its playback time ('at'), so the page can play the
     preview back smoothly. fps_cap = 0: full speed with a sparse preview."""
     fps, total, sf, ef = _frame_range(sess, t0, t1)
-    rect = roi_rect(p, sess['orig_w'], sess['orig_h'])
-    if rect is None:
-        yield {'error': 'Tracking box is empty or outside the frame.'}; return
     n_total = ef - sf
     if n_total <= 0:
         yield {'error': 'Nothing to analyse (empty time range).'}; return
-    ctr = wa.LiveEstimator(p)
-    recs = []                                   # (frame index, light record)
+    ext, ctr = wa.FrameExtractor(sess['scale']), wa.LiveTracker(p)
     cap = float(fps_cap) if (live and fps_cap and fps_cap > 0) else 0.0
     pe = (1 if cap else max(1, int(every))) if live else 0
-    pms = 0 if cap else 300
-    st = {'proc': 0, 'next': sf}
+    st = {'proc': 0, 'next': sf, 'last_pv': 0.0}
     clk = {'origin': None, 'begin': None}
     notes = []
     t_start = time.time()
 
     def consume(reader):
-        for i, g, pv in reader:
-            res, rec = detect_rec(g, rect[0], rect[1], p)
-            recs.append((i, rec))
-            live_rot = ctr.step(i, res)
+        for i, bgr in reader:
+            raw, box, pr = _feed(ext, i, bgr)
+            lv = ctr.step(pr)
             st['proc'] += 1; st['next'] = i + 1
             at = None
             if cap:
@@ -339,53 +312,56 @@ def run_analysis_stream(sess, p, live=False, every=3, t0=None, t1=None, fps_cap=
                 if due > now: time.sleep(due - now)
                 elif now - due > 0.25: clk['begin'] += now - due     # fell behind: no burst catch-up
                 at = clk['begin'] + (st['proc'] - 1) / cap - clk['origin']
-            if pv is not None:
-                img, sc = pv
-                out = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) if img.ndim == 2 else img.copy()
-                draw_overlay(out, res, p, sc, live_rot)
+            want = False
+            if live:
+                if cap: want = True
+                else:
+                    now = time.time()
+                    if (st['proc'] - 1) % pe == 0 and now - st['last_pv'] >= PREVIEW_MS / 1000.0:
+                        want, st['last_pv'] = True, now
+            if want:
+                tape = 'found' if lv['found'] else ('hidden' if ctr.med is not None and box is not None else None)
+                small, sc = fit_display(bgr, 640)
+                draw_overlay(small, sc, box, raw is not None, lv['y'], tape, lv['phase'],
+                             lv['rot'] if box is not None else None, lv['laps'], i / fps if fps > 0 else 0.0)
                 yield {'preview': {'frame': i, 'time_s': round(i / fps if fps > 0 else 0.0, 5),
-                                   'image': encode_jpeg(out, quality=70), 'state': res['state'], 'at': at,
-                                   'found': res['found'], 'y': res['y'] if res['found'] else None, 'rotation_count': round(live_rot, 2),
-                                   'total_frames': n_total, 'start_frame': sf}}
+                                   'image': encode_jpeg(small, quality=70), 'at': at,
+                                   'wheel': 'none' if box is None else ('detected' if raw is not None else 'held'),
+                                   'tape': tape, 'y': lv['y'], 'rotation_count': round(lv['rot'], 2),
+                                   'laps': lv['laps'], 'total_frames': n_total, 'start_frame': sf}}
 
     try:
-        yield from consume(RANGE_READER(sess, sf, ef, rect, pe, pms))
+        yield from consume(RANGE_READER(sess, sf, ef))
+    except UserError:
+        raise
     except Exception as e:
         if RANGE_READER is cv_range_reader: raise
         notes.append(f"Fast decoder failed ({e}); finished with the slow fallback")
-        yield from consume(cv_range_reader(sess, st['next'], ef, rect, pe, pms))
+        yield from consume(cv_range_reader(sess, st['next'], ef))
     proc = st['proc']
     if not proc:
         yield {'error': 'No frames could be decoded.'}; return
     dt = max(1e-6, time.time() - t_start)
-    extra = ["Parallel parts: 1", f"Processing time: {dt:.2f} s ({proc / dt:.0f} frames/s)"]
-    if proc < n_total: extra.append(f"Warning: decoded {proc} of {n_total} frames")
+    extra = ["parallel parts: 1", f"processing time: {dt:.2f} s ({proc / dt:.0f} frames/s)"]
+    if proc < n_total: extra.append(f"warning: decoded {proc} of {n_total} frames")
     extra += notes
     print(f"ANALYSIS: {proc} frames in {dt:.1f}s ({proc / dt:.0f} fps)")
-    try:
-        sol = wa.solve([r for _, r in recs], p)
-    except RuntimeError as e:
-        yield {'error': str(e)}; return
-    yield finish_event(sol, [i for i, _ in recs], rect[0], rect[1], fps, p, sf, ef, total, extra)
+    sol = _solve([ext], p)
+    yield finish_event(sol, fps, p, sf, ef, extra, sess)
 
 
-# ---- Fast / parallel analysis: read only the ROI, split the video into parts ----
-def cv_range_reader(sess, sf, ef, rect, preview_every=0, preview_ms=300):
-    """Generic reader: yields (frame_index, gray ROI, preview) where preview is None or
-    (picture, scale). Android replaces RANGE_READER with a hardware-decoder version (main.py)."""
-    x0, y0, x1, y1 = rect
+# ---- Fast / parallel analysis: split the video into parts, measure each part on its own thread ----
+def cv_range_reader(sess, sf, ef):
+    """Generic reader: yields (frame_index, BGR frame sub-sampled by sess['step']) for frames
+    [sf, ef). Android replaces RANGE_READER with a hardware-decoder version (main.py)."""
+    st = sess['step']
     cap = cv2.VideoCapture(sess['video_path'])
     try:
         if sf: cap.set(cv2.CAP_PROP_POS_FRAMES, sf)
-        last_pv = 0.0
         for i in range(sf, ef):
             ok, fr = cap.read()
             if not ok: break
-            pv = None
-            if preview_every and (i - sf) % preview_every == 0 and time.time() - last_pv >= preview_ms / 1000.0:
-                last_pv = time.time()
-                pv = fit_display(fr, 640)
-            yield i, cv2.cvtColor(fr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY), pv
+            yield i, (np.ascontiguousarray(fr[::st, ::st]) if st > 1 else fr)
     finally:
         cap.release()
 
@@ -394,41 +370,40 @@ RANGE_READER = cv_range_reader
 
 
 def run_parallel_stream(sess, p, parts=2, t0=None, t1=None):
-    """Split [start, end) into `parts` chunks, detect the tape in each chunk on its own
-    thread (per-frame detection is independent), then run the rotation state machine ONCE,
-    in order, over the merged detections. Result is identical to a sequential run, and
-    there is nothing to reconcile at chunk boundaries."""
+    """Split [start, end) into `parts` chunks, find the flywheel and take the brightness profile of
+    every frame of a chunk on its own thread (per-frame measurement is independent), then join the
+    chunks (the 'last known box' rule carries over chunk borders) and track the tape ONCE, in order.
+    Result is identical to a sequential run."""
     fps, total, sf, ef = _frame_range(sess, t0, t1)
-    rect = roi_rect(p, sess['orig_w'], sess['orig_h'])
-    if rect is None:
-        yield {'error': 'Tracking box is empty or outside the frame.'}; return
     n_frames = ef - sf
     if n_frames <= 0:
         yield {'error': 'Nothing to analyse (empty time range).'}; return
     n = max(1, min(int(parts), 8, n_frames))
     edges = [sf + n_frames * k // n for k in range(n + 1)]
-    results = [[] for _ in range(n)]
+    exts = [wa.FrameExtractor(sess['scale']) for _ in range(n)]
     counts, errs, notes = [0] * n, [None] * n, []
     stop = threading.Event()
 
     def consume(k, reader):
-        out = results[k]
-        for i, g, _pv in reader:
+        ext = exts[k]
+        for i, bgr in reader:
             if stop.is_set(): return
-            out.append((i, wa.measure_frame(g)))
-            counts[k] = len(out)
+            _feed(ext, i, bgr)
+            counts[k] = len(ext.idx)
 
     def worker(k):
         a, b = edges[k], edges[k + 1]
         try:
-            consume(k, RANGE_READER(sess, a, b, rect))
+            consume(k, RANGE_READER(sess, a, b))
+        except UserError as e:
+            errs[k] = str(e); stop.set()
         except Exception as e:
             if RANGE_READER is cv_range_reader:
                 errs[k] = str(e); return
-            notes.append(f"Part {k + 1}: fast decoder failed ({e}); used slow fallback")
-            results[k].clear(); counts[k] = 0
+            notes.append(f"part {k + 1}: fast decoder failed ({e}); used slow fallback")
+            exts[k] = wa.FrameExtractor(sess['scale']); counts[k] = 0
             try:
-                consume(k, cv_range_reader(sess, a, b, rect))
+                consume(k, cv_range_reader(sess, a, b))
             except Exception as e2:
                 errs[k] = str(e2)
 
@@ -446,21 +421,16 @@ def run_parallel_stream(sess, p, parts=2, t0=None, t1=None):
         stop.set()
     if any(errs):
         yield {'error': next(e for e in errs if e)}; return
-    dets = [x for r in results for x in r]
-    if not dets:
+    done = sum(len(e.idx) for e in exts)
+    if not done:
         yield {'error': 'No frames could be decoded.'}; return
     wall = max(1e-6, time.time() - t_start)
-    try:
-        sol = wa.solve([r for _, r in dets], p)
-    except RuntimeError as e:
-        yield {'error': str(e)}; return
-    extra = [f"Parallel parts: {n}",
-             f"Processing time: {wall:.2f} s ({len(dets) / wall:.0f} frames/s)"]
-    if len(dets) < n_frames:
-        extra.append(f"Warning: decoded {len(dets)} of {n_frames} frames")
+    sol = _solve(exts, p)
+    extra = [f"parallel parts: {n}", f"processing time: {wall:.2f} s ({done / wall:.0f} frames/s)"]
+    if done < n_frames: extra.append(f"warning: decoded {done} of {n_frames} frames")
     extra += notes
-    print(f"PARALLEL ANALYSIS: {len(dets)} frames, {n} parts, {wall:.1f}s ({len(dets) / wall:.0f} fps)")
-    yield finish_event(sol, [i for i, _ in dets], rect[0], rect[1], fps, p, sf, ef, total, extra)
+    print(f"PARALLEL ANALYSIS: {done} frames, {n} parts, {wall:.1f}s ({done / wall:.0f} fps)")
+    yield finish_event(sol, fps, p, sf, ef, extra, sess)
 
 
 # ---------- Routes ----------
@@ -498,9 +468,11 @@ def upload():
         src.close(); _rm(tmp)
         return jsonify({'error': 'cannot read first frame'}), 400
     h, w = frame.shape[:2]
+    step = max(1, int(math.ceil(w / float(DETECT_W))))
     for old in list(SESSIONS): drop_session(old)        # keep only the video that is loaded now
     SESSIONS[sid] = {'video_path': tmp, 'fps': fps, 'total_frames': total, 'src': src,
-                     'orig_w': w, 'orig_h': h, 'filename': name}
+                     'orig_w': w, 'orig_h': h, 'filename': name, 'result': None,
+                     'step': step, 'scale': 1.0 / step}
     return jsonify({'sid': sid, 'fps': fps, 'total_frames': total,
                     'orig_w': w, 'orig_h': h, 'filename': name,
                     'duration': total / fps if fps else 0})
@@ -508,6 +480,8 @@ def upload():
 
 @app.route('/render', methods=['POST'])
 def render():
+    """One annotated frame for the slider. After an analysis (use_result) the box, tape, dial and
+    rotation counter come from that analysis; before it only the flywheel is detected in this frame."""
     t0 = time.time()
     d = request.get_json(force=True)
     sess = SESSIONS.get(d.get('sid'))
@@ -516,22 +490,30 @@ def render():
     frame = sess['src'].get(idx)
     if frame is None: return jsonify({'error': 'cannot read frame'}), 400
     t1 = time.time()
-    p = extract_params(d)
-    if d.get('show_mask'):
-        res = process_frame(frame, p)                       # full-frame mask, only when asked for
-        disp = cv2.cvtColor(res['mask'], cv2.COLOR_GRAY2BGR)
-        disp, sc = fit_display(disp)
+    res = sess.get('result') if d.get('use_result') else None
+    k = None
+    if res is not None:
+        k = int(np.searchsorted(res['idx'], idx))
+        if k >= len(res['idx']) or res['idx'][k] != idx: k = None
+    disp, sc = fit_display(frame)
+    if k is not None:
+        box, detected, found = res['box'][k] * sess['step'], bool(res['raw_ok'][k]), bool(res['found'][k])
+        ty = float(res['y'][k]) if found else None
+        ph = float(res['phase'][k])
+        rot = (ph - float(res['phase'][0])) / 360.0
+        laps = int(np.searchsorted(res['entries'], k, side='right'))
+        draw_overlay(disp, sc, box, detected, ty, 'found' if found else 'hidden', ph, rot, laps,
+                     idx / sess['fps'])
+        out = {'wheel': 'detected' if detected else 'held', 'tape': 'found' if found else 'hidden',
+               'y': ty, 'rotation_count': round(rot, 2), 'laps': laps}
     else:
-        rect = roi_rect(p, frame.shape[1], frame.shape[0])
-        if rect is None: res = _empty_res()
-        else:
-            x0, y0, x1, y1 = rect                            # detect inside the tracking box only
-            res = detect_gray(cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY), x0, y0, p)
-        disp, sc = fit_display(frame)
-        rot = d.get('rot')
-        draw_overlay(disp, res, p, sc, None if rot is None else float(rot))
-    out = {'image': encode_jpeg(disp), 'state': res['state'], 'found': res['found'],
-           'y': res['y'] if res['found'] else None}
+        st = sess['step']
+        box = wa.detect_flywheel(frame[::st, ::st], sess['scale'])
+        if box is not None: box = tuple(v * st for v in box)
+        draw_overlay(disp, sc, box, box is not None)
+        out = {'wheel': 'detected' if box is not None else 'none', 'tape': None, 'y': None,
+               'rotation_count': None, 'laps': None}
+    out['image'] = encode_jpeg(disp)
     print(f"RENDER frame {idx}: decode {1000 * (t1 - t0):.0f} ms, rest {1000 * (time.time() - t1):.0f} ms")
     return jsonify(out)
 
@@ -565,26 +547,29 @@ def crop_strip():
                     'duration': round(dur, 3), 'fps': fps})
 
 
+def _time_range(d):
+    t0 = d.get('time_start'); t1 = d.get('time_end')
+    t0 = max(0.0, float(t0)) if t0 is not None else None
+    t1 = max(0.0, float(t1)) if t1 is not None else None
+    return t0, t1
+
+
 @app.route('/analyze', methods=['POST'])
 def analyze():
     d = request.get_json(force=True)
     sess = SESSIONS.get(d.get('sid'))
     if not sess: return jsonify({'error': 'invalid session'}), 400
     p = extract_params(d)
-    if None in (p['y_top'], p['y_bottom'], p['x_left'], p['x_right']):
-        return jsonify({'error': 'Set TOP, BOTTOM, LEFT, RIGHT boundaries first.'}), 400
     live, every = bool(d.get('live_preview')), max(1, int(d.get('preview_every', 3)))
     try: fps_cap = max(0.0, min(120.0, float(d.get('fps_cap') or 0)))
     except (TypeError, ValueError): fps_cap = 0.0
-    t0 = d.get('time_start'); t1 = d.get('time_end')
-    t0 = max(0.0, float(t0)) if t0 is not None else None
-    t1 = max(0.0, float(t1)) if t1 is not None else None
+    t0, t1 = _time_range(d)
     if t0 is not None and t1 is not None and t1 <= t0:
         return jsonify({'error': 'End time must be greater than start time.'}), 400
 
     def gen():
         try:
-            # Without live preview no colour frames are needed: use the fast ROI-only path.
+            # Without live preview nothing has to be drawn: use the plain one-part reader path.
             it = run_analysis_stream(sess, p, live, every, t0, t1, fps_cap) if live \
                  else run_parallel_stream(sess, p, 1, t0, t1)
             for ev in it:
@@ -601,12 +586,8 @@ def fast_analyze():
     sess = SESSIONS.get(d.get('sid'))
     if not sess: return jsonify({'error': 'invalid session'}), 400
     p = extract_params(d)
-    if None in (p['y_top'], p['y_bottom'], p['x_left'], p['x_right']):
-        return jsonify({'error': 'Set TOP, BOTTOM, LEFT, RIGHT boundaries first.'}), 400
     parts = max(1, min(int(d.get('parts', 2) or 2), 8))
-    t0 = d.get('time_start'); t1 = d.get('time_end')
-    t0 = max(0.0, float(t0)) if t0 is not None else None
-    t1 = max(0.0, float(t1)) if t1 is not None else None
+    t0, t1 = _time_range(d)
     if t0 is not None and t1 is not None and t1 <= t0:
         return jsonify({'error': 'End time must be greater than start time.'}), 400
 
@@ -698,6 +679,11 @@ progress::-moz-progress-bar{background:#4299e1}
 .selection-info{font-size:13px;color:#ecc94b;margin-top:8px;font-weight:600}
 .summary-bar{position:sticky;bottom:0;background:#1a1a1a;border-top:1px solid #333;padding:12px 20px;display:flex;gap:20px;align-items:center;justify-content:center;font-size:13px}
 .summary-bar .val{color:#ecc94b;font-weight:600}
+
+.stats.three{grid-template-columns:1fr 1fr 1fr}
+.stats .mid{font-size:15px}
+.hint{font-size:12px;color:#888}
+.ok{color:#68d391 !important}.warn{color:#f6ad55 !important}.bad{color:#fc8181 !important}
 </style>
 </head>
 <body>
@@ -720,51 +706,32 @@ progress::-moz-progress-bar{background:#4299e1}
     </div></div>
 
     <div class="panel">
-      <div class="video-wrap"><img id="frameImg" alt="Click to set ROI"></div>
+      <div class="video-wrap"><img id="frameImg" alt="Video frame"></div>
       <input type="range" id="frameSlider" min="0" max="0" value="0" disabled>
       <div id="frameInfo" class="status">Frame: 0 / 0 &nbsp; Time: 0.00s</div>
-      <div class="roi-grid">
-        <button id="btnTop" onclick="setPickMode('top')">1) Set Wheel TOP</button>
-        <button id="btnBottom" onclick="setPickMode('bottom')">2) Set Wheel BOTTOM</button>
-        <button id="btnLeft" onclick="setPickMode('left')">3) Set Wheel LEFT edge</button>
-        <button id="btnRight" onclick="setPickMode('right')">4) Set Wheel RIGHT edge</button>
-      </div>
-      <div id="statusMsg" class="status">Set the Top, Bottom, Left and Right boundaries so the box surrounds the whole wheel (small margin is fine). The wheel and the tape are found automatically inside it.</div>
-      <div class="stats">
-        <div>State<span id="lblState" class="big">-</span></div>
-        <div>Y<span id="lblY" class="big">-</span></div>
-        <div>Expecting<span id="lblExpect" class="big">top</span></div>
-        <div>Elapsed<span id="lblTime" class="big">0.00s</span></div>
-        <div style="grid-column:span 2">Rotations<span id="lblCount" class="big">0</span></div>
+      <div id="statusMsg" class="status">Load a side-view video of the flywheel: a gray block crossing the blue bracket, one black tape on the rim. Nothing has to be marked by hand &ndash; the flywheel is found automatically in every frame. Drag the slider to check it (green box = detected, orange = last known position kept).</div>
+      <div class="stats three">
+        <div>Flywheel<span id="lblWheel" class="big mid">-</span></div>
+        <div>Tape<span id="lblTape" class="big mid">-</span></div>
+        <div>Tape height<span id="lblY" class="big mid">-</span></div>
+        <div>Laps seen<span id="lblLaps" class="big mid">-</span></div>
+        <div>Elapsed<span id="lblTime" class="big mid">0.00s</span></div>
+        <div>Rotations<span id="lblCount" class="big">0</span></div>
       </div>
     </div>
   </div>
 
   <div>
     <div class="panel">
-      <h3>Grayscale Threshold</h3>
-      <div class="row"><label>Black Limit</label>
-        <input type="number" id="threshNum" value="60" min="0" max="255" style="width:70px"></div>
-      <input type="range" id="threshRange" min="0" max="255" value="60">
-      <div class="row" style="margin-top:8px"><input type="checkbox" id="showMask">
-        <label for="showMask">Show binary mask</label></div>
-    </div>
-
-    <div class="panel">
-      <h3>Detection Parameters</h3>
-      <div class="row"><label style="flex:1">Min blob area (px)</label>
-        <input type="number" id="minArea" value="100" style="width:90px"></div>
-      <div class="row"><label style="flex:1">Max blob area (0 = unlimited)</label>
-        <input type="number" id="maxArea" value="0" style="width:90px"></div>
-      <div class="row"><label style="flex:1">Debounce frames</label>
-        <input type="number" id="debounce" value="2" min="1" max="30" style="width:70px"></div>
-      <div class="row"><label style="flex:1">Tape motion</label>
-        <select id="direction" style="flex:1">
-          <option value="down">Top &rarr; Mid &rarr; Bottom &rarr; Hidden</option>
-          <option value="up">Bottom &rarr; Mid &rarr; Top &rarr; Hidden</option>
-        </select></div>
-      <div class="row"><input type="checkbox" id="strict">
-        <label for="strict">Strict sequence mode</label></div>
+      <h3>Tape Detection</h3>
+      <div class="row"><label style="flex:1">Dark threshold</label>
+        <input type="number" id="darkNum" value="0.70" min="0.30" max="0.95" step="0.01" style="width:80px"></div>
+      <input type="range" id="darkRange" min="0.30" max="0.95" step="0.01" value="0.70">
+      <div class="hint" style="margin:4px 0 10px">The tape is where the brightness of a wheel row falls below this fraction of its usual value (the median over the whole video, so the rod, shaft and edges cancel out). Raise it if the tape is not found, lower it if glare is picked up.</div>
+      <div class="row"><label style="flex:1">New-lap jump</label>
+        <input type="number" id="lapNum" value="0.30" min="0.10" max="0.90" step="0.01" style="width:80px"></div>
+      <input type="range" id="lapRange" min="0.10" max="0.90" step="0.01" value="0.30">
+      <div class="hint" style="margin-top:4px">A new lap starts when the tape jumps back up the wheel by more than this fraction of its height.</div>
     </div>
 
     <div class="panel">
@@ -790,7 +757,7 @@ progress::-moz-progress-bar{background:#4299e1}
         </select></div>
       <div class="row"><label style="flex:1">Preview every N frames <span class="status">(unlimited only)</span></label>
         <input type="number" id="previewEvery" value="3" min="1" max="60" style="width:70px"></div>
-      <div class="status">With a cap, every frame is analysed and shown at that speed so you can count along; a high-fps video plays in slow motion. Choose Unlimited or untick the preview for the fastest run.</div>
+      <div class="status">The live preview shows a running estimate; the exact count (the tape height is compared with the median of the whole video) appears when the run finishes. With a cap, every frame is analysed and shown at that speed so you can count along. Choose Unlimited or untick the preview for the fastest run.</div>
       <div class="row">
         <button id="btnRun" onclick="runAnalysis()">Run Full Analysis</button>
         <button class="secondary" onclick="resetAnalysis()">Reset</button>
@@ -804,6 +771,12 @@ progress::-moz-progress-bar{background:#4299e1}
   <div class="panel">
     <h3>Results</h3>
     <pre class="summary" id="summary">Run an analysis to see results here.</pre>
+    <div class="mtable-wrap" id="lapsWrap" style="display:none;margin-top:10px">
+      <table class="mtable" style="min-width:320px">
+        <thead><tr><th>Lap</th><th>Starts at frame</th><th>Time (s)</th><th>Period (s)</th></tr></thead>
+        <tbody id="lapsBody"></tbody>
+      </table>
+    </div>
     <div class="row" style="margin-top:10px"><button onclick="exportCSV()">Export CSV</button></div>
     <img id="plot" class="plot" style="display:none">
   </div>
@@ -865,11 +838,11 @@ progress::-moz-progress-bar{background:#4299e1}
 <div class="crop-page">
   <div class="panel">
     <h3>Parallel Analysis <span class="badge live-badge" id="fastBadge">RUNNING</span></h3>
-    <div class="hint" style="font-size:12px;color:#888;margin-bottom:8px">
-      Uses the video, tracking box and detection settings from the Analysis tab. The video is
-      split into parts that are decoded and analysed at the same time; rotations are then counted
+    <div class="hint" style="margin-bottom:8px">
+      Uses the video and the tape-detection settings from the Analysis tab. The video is split into
+      parts; the flywheel is found and measured in all parts at the same time. The tape is then tracked
       once, in order, so the result is the same as a normal run.</div>
-    <div id="fastRoiInfo" class="status">Tracking box: not set</div>
+    <div id="fastRoiInfo" class="status">No video loaded (use the Analysis tab).</div>
     <div class="row"><label style="flex:1">Parallel parts (1-8)</label>
       <input type="number" id="fastParts" value="2" min="1" max="8" style="width:70px"></div>
     <div class="row"><input type="checkbox" id="fastCrop">
@@ -947,8 +920,7 @@ progress::-moz-progress-bar{background:#4299e1}
 
 <script>
 const S = {sid:null, fps:30, totalFrames:0, origW:0, origH:0, duration:0,
-  currentFrame:0, pickMode:null, y_top:null, y_bottom:null, x_left:null,
-  x_right:null, history:[], analyzing:false, cropStart:0, cropEnd:0,
+  currentFrame:0, history:[], laps:[], analyzing:false, cropStart:0, cropEnd:0,
   startSel:0, endSel:0};
 const STRIP_BEFORE = 3.0, STRIP_AFTER = 3.0, STRIP_N = 20;
 
@@ -965,24 +937,32 @@ function showTab(name) {
   if (name === 'crop' && S.sid && !$('startStrip').dataset.loaded) {
     loadStartWindow(); loadEndWindow();
   }
-  if (name === 'fast') updateFastRoi();
+  if (name === 'fast') updateFastInfo();
 }
 
-function updateFastRoi() {
-  const ok = [S.y_top, S.y_bottom, S.x_left, S.x_right].every(v => v !== null);
+function updateFastInfo() {
   $('fastRoiInfo').textContent = !S.sid ? 'No video loaded (use the Analysis tab).'
-    : ok ? `Tracking box: x ${Math.min(S.x_left, S.x_right)}-${Math.max(S.x_left, S.x_right)}, ` +
-           `y ${Math.min(S.y_top, S.y_bottom)}-${Math.max(S.y_top, S.y_bottom)}`
-         : 'Tracking box: not set (set TOP, BOTTOM, LEFT, RIGHT on the Analysis tab).';
+    : `Video: ${S.origW} x ${S.origH}, ${S.totalFrames} frames. Dark threshold ${(+$('darkNum').value).toFixed(2)}, ` +
+      `new-lap jump ${(+$('lapNum').value).toFixed(2)}.`;
 }
 
 function getParams() {
-  return {sid: S.sid, frame_idx: S.currentFrame, y_top: S.y_top,
-    y_bottom: S.y_bottom, x_left: S.x_left, x_right: S.x_right,
-    black_thresh: +$('threshNum').value, min_area: +$('minArea').value,
-    max_area: +$('maxArea').value, debounce: +$('debounce').value,
-    direction: $('direction').value, strict: $('strict').checked,
-    show_mask: $('showMask').checked};
+  return {sid: S.sid, frame_idx: S.currentFrame,
+    dark_thr: +$('darkNum').value, new_lap_jump: +$('lapNum').value,
+    use_result: S.history.length > 0};
+}
+
+// ---- status labels (flywheel / tape / height / laps / rotations) ----
+function setLabels(d) {
+  const w = d.wheel, t = d.tape;
+  const lw = $('lblWheel'), lt = $('lblTape');
+  lw.textContent = w === 'detected' ? 'DETECTED' : w === 'held' ? 'HELD' : w === 'none' ? 'NOT FOUND' : '-';
+  lw.className = 'big mid ' + (w === 'detected' ? 'ok' : w === 'held' ? 'warn' : w === 'none' ? 'bad' : '');
+  lt.textContent = t === 'found' ? 'FOUND' : t === 'hidden' ? 'BEHIND WHEEL' : '-';
+  lt.className = 'big mid ' + (t === 'found' ? 'ok' : t === 'hidden' ? 'warn' : '');
+  $('lblY').textContent = (t === 'found' && d.y != null) ? (100 * d.y).toFixed(0) + ' %' : '-';
+  $('lblLaps').textContent = d.laps != null ? d.laps : '-';
+  if (d.rotation_count != null) $('lblCount').textContent = d.rotation_count;
 }
 
 // ---- Upload ----
@@ -1000,8 +980,7 @@ async function uploadVideo() {
   Object.assign(S, {sid: data.sid, fps: data.fps,
     totalFrames: data.total_frames, origW: data.orig_w, origH: data.orig_h,
     duration: data.duration || data.total_frames / data.fps,
-    currentFrame: 0, y_top: null, y_bottom: null, x_left: null, x_right: null,
-    history: [], cropStart: 0, cropEnd: data.duration,
+    currentFrame: 0, history: [], laps: [], cropStart: 0, cropEnd: data.duration,
     startSel: 0, endSel: data.duration});
   $('fileLabel').textContent = data.filename;
   $('cropFileName').textContent = data.filename;
@@ -1015,12 +994,8 @@ async function uploadVideo() {
       `Frame: ${S.currentFrame} / ${S.totalFrames}   Time: ${(S.currentFrame / S.fps).toFixed(2)}s`;
     renderFrame();
   };
-  $('lblCount').textContent = '0';
-  $('summary').textContent = 'Run an analysis to see results here.';
-  $('plot').style.display = 'none';
-  $('fastSummary').textContent = 'Run an analysis to see results here.';
-  $('fastPlot').style.display = 'none'; $('fastStatus').textContent = '';
-  updateCropBadge(); updateCropBar(); updateCropInfo(); renderFrame();
+  resetAnalysis();
+  updateCropBadge(); updateCropBar(); updateCropInfo(); renderFrame(); updateFastInfo();
   $('startStrip').dataset.loaded = ''; $('endStrip').dataset.loaded = '';
   if ($('pageCrop').classList.contains('active')) { loadStartWindow(); loadEndWindow(); }
 }
@@ -1029,14 +1004,8 @@ async function uploadVideo() {
 // Only ONE /render request is in flight at a time. While the slider is dragged, further calls just
 // mark the request as dirty and the newest position is rendered when the current one returns, so
 // the server never builds a queue of frames nobody will look at.
-// Rotation count at a frame, taken from the last analysis (null before any analysis / outside its range).
-function rotAtFrame(f) {
-  const h = S.history;
-  if (!h || !h.length || f < h[0].frame || f > h[h.length - 1].frame) return null;
-  let lo = 0, hi = h.length - 1;
-  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (h[mid].frame <= f) lo = mid; else hi = mid - 1; }
-  return h[lo].rotation_count;
-}
+// After an analysis the frame is drawn from its results (box, tape, dial, rotation counter);
+// before it, only the flywheel is detected in the shown frame.
 let _rBusy = false, _rDirty = false;
 async function renderFrame() {
   if (!S.sid || S.analyzing) return;
@@ -1046,8 +1015,6 @@ async function renderFrame() {
     do {
       _rDirty = false;
       const p = getParams();
-      const rot = rotAtFrame(p.frame_idx);
-      if (rot !== null) p.rot = rot;
       let data;
       try { data = await postJSON('/render', p); }
       catch (e) { console.warn('render failed', e); continue; }
@@ -1056,48 +1023,27 @@ async function renderFrame() {
       $('frameImg').src = data.image;
       $('frameInfo').textContent =
         `Frame: ${p.frame_idx} / ${S.totalFrames}   Time: ${(p.frame_idx / S.fps).toFixed(2)}s`;
-      $('lblState').textContent = data.found ? data.state.toUpperCase() : 'HIDDEN';
-      $('lblY').textContent = (data.found && data.y != null) ? Math.round(data.y) + ' px' : '-';
+      $('lblTime').textContent = (p.frame_idx / S.fps).toFixed(2) + 's';
+      setLabels(data);
     } while (_rDirty);
   } finally { _rBusy = false; }
 }
 
-// ---- ROI ----
-function setPickMode(mode) {
-  if (!S.sid) return alert('Load a video first.');
-  if (S.analyzing) return;
-  S.pickMode = mode;
-  ['top','bottom','left','right'].forEach(m => {
-    $('btn' + m[0].toUpperCase() + m.slice(1))
-      .classList.toggle('pick-active', m === mode);
-  });
-  $('statusMsg').textContent =
-    `Click on the video frame to set the ${mode.toUpperCase()} boundary.`;
+// ---- Tape-detection settings ----
+function bindPair(numId, rangeId, lo, hi) {
+  const num = $(numId), rng = $(rangeId);
+  const changed = () => {
+    updateFastInfo();
+    if (S.history.length) $('statusMsg').textContent = 'Settings changed - run the analysis again to update the result.';
+  };
+  rng.oninput = () => { num.value = (+rng.value).toFixed(2); changed(); };
+  num.onchange = () => {
+    const v = Math.max(lo, Math.min(hi, +num.value || lo));
+    num.value = v.toFixed(2); rng.value = v; changed();
+  };
 }
-$('frameImg').addEventListener('click', e => {
-  if (!S.pickMode || !S.sid || S.analyzing) return;
-  const r = e.target.getBoundingClientRect();
-  const x = Math.round((e.clientX - r.left) * (S.origW || e.target.naturalWidth) / r.width);
-  const y = Math.round((e.clientY - r.top) * (S.origH || e.target.naturalHeight) / r.height);
-  if (S.pickMode === 'top') S.y_top = y;
-  else if (S.pickMode === 'bottom') S.y_bottom = y;
-  else if (S.pickMode === 'left') S.x_left = x;
-  else S.x_right = x;
-  $('statusMsg').textContent = `Boundary ${S.pickMode.toUpperCase()} set.`;
-  S.pickMode = null;
-  ['top','bottom','left','right'].forEach(m =>
-    $('btn' + m[0].toUpperCase() + m.slice(1)).classList.remove('pick-active'));
-  updateFastRoi(); renderFrame();
-});
-
-// ---- Threshold ----
-$('threshRange').oninput = e => { $('threshNum').value = e.target.value; renderFrame(); };
-$('threshNum').onchange = e => {
-  const v = Math.max(0, Math.min(255, +e.target.value || 0));
-  e.target.value = v; $('threshRange').value = v; renderFrame();
-};
-$('showMask').onchange = renderFrame;
-['minArea','maxArea'].forEach(id => $(id).onchange = renderFrame);
+bindPair('darkNum', 'darkRange', 0.30, 0.95);
+bindPair('lapNum', 'lapRange', 0.10, 0.90);
 
 // ---- Crop helpers ----
 function updateCropBadge() {
@@ -1215,7 +1161,6 @@ function applyCrop(target) {
 const applyCropToAnalysis = () => applyCrop('analysis');
 const applyCropToFast = () => applyCrop('fast');
 
-// ---- Analysis ----
 // ---- Live preview playback ----
 // Capped runs stamp every preview with its playback time ('at', seconds since the first frame). The page
 // keeps a small jitter buffer and shows each frame when its time comes, so playback stays even even if
@@ -1223,9 +1168,7 @@ const applyCropToFast = () => applyCrop('fast');
 const Live = {q: [], base: null, raf: 0};
 function liveShow(q) {
   $('frameImg').src = q.image;
-  $('lblState').textContent = (q.state || 'hidden').toUpperCase();
-  $('lblY').textContent = q.y != null ? Math.round(q.y) + ' px' : '-';
-  $('lblCount').textContent = q.rotation_count;
+  setLabels({wheel: q.wheel, tape: q.tape, y: q.y, laps: q.laps, rotation_count: q.rotation_count});
   $('lblTime').textContent = q.time_s.toFixed(2) + 's';
   $('frameInfo').textContent =
     `Frame: ${q.frame} / ${q.total_frames + (q.start_frame || 0)}   Time: ${q.time_s.toFixed(2)}s`;
@@ -1259,16 +1202,54 @@ function syncLiveControls() {
 $('livePreview').onchange = $('fpsCap').onchange = syncLiveControls;
 syncLiveControls();
 
+// ---- Results ----
+function showResult(ev, prefix) {
+  S.history = ev.history || [];
+  S.laps = ev.laps || [];
+  $('summary').textContent = ev.summary;
+  $('lblCount').textContent = ev.rotation_count;
+  $('lblLaps').textContent = S.laps.length;
+  const body = $('lapsBody');
+  body.innerHTML = S.laps.map(l =>
+    `<tr><td>${l.lap}</td><td>${l.frame}</td><td>${l.time_s.toFixed(3)}</td>` +
+    `<td>${l.period_s == null ? '-' : l.period_s.toFixed(3)}</td></tr>`).join('');
+  $('lapsWrap').style.display = S.laps.length ? 'block' : 'none';
+  if (ev.plot) { $('plot').src = ev.plot; $('plot').style.display = 'block'; }
+  if (prefix === 'fast') {
+    $('fastSummary').textContent = ev.summary;
+    if (ev.plot) { $('fastPlot').src = ev.plot; $('fastPlot').style.display = 'block'; }
+  }
+  $('statusMsg').textContent = `Done: ${ev.rotation_count} rotations (${ev.rotations_seen} from tape sightings). Drag the slider to review any frame.`;
+}
+
+async function readStream(resp, onEvent) {
+  const reader = resp.body.getReader(), dec = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const {value, done} = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, {stream: true});
+    let i;
+    while ((i = buf.indexOf('\n\n')) !== -1) {
+      const raw = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
+      if (!raw.startsWith('data:')) continue;
+      let ev; try { ev = JSON.parse(raw.slice(5).trim()); } catch { continue; }
+      if (onEvent(ev) === false) return false;
+    }
+  }
+  return true;
+}
+
 async function runAnalysis() {
   if (!S.sid) return alert('Load a video first.');
-  if (S.y_top === null || S.y_bottom === null || S.x_left === null || S.x_right === null)
-    return alert('Set TOP, BOTTOM, LEFT, RIGHT boundaries first.');
   const cropOn = $('enableCrop').checked;
   if (cropOn && S.cropEnd <= S.cropStart) return alert('End time must be greater than start time.');
   const btn = $('btnRun'), badge = $('liveBadge'), live = $('livePreview').checked;
   S.analyzing = true; btn.disabled = true; btn.textContent = 'Analyzing...';
   $('progress').value = 2;
   if (live) badge.classList.add('active');
+  S.history = []; S.laps = [];
+  $('lblCount').textContent = '0';
 
   const p = getParams();
   p.live_preview = live; p.preview_every = +$('previewEvery').value || 3;
@@ -1284,49 +1265,31 @@ async function runAnalysis() {
       try { m = (await resp.json()).error || m; } catch {}
       return alert(m);
     }
-    const reader = resp.body.getReader(), dec = new TextDecoder();
-    let buf = '';
-    while (true) {
-      const {value, done} = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, {stream: true});
-      let i;
-      while ((i = buf.indexOf('\n\n')) !== -1) {
-        const raw = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
-        if (!raw.startsWith('data:')) continue;
-        let ev; try { ev = JSON.parse(raw.slice(5).trim()); } catch { continue; }
-        if (ev.error) return alert(ev.error);
-        if (ev.progress !== undefined) $('progress').value = Math.max(2, ev.progress * 95);
-        if (ev.preview) livePush(ev.preview);
-        if (ev.done) {
-          liveReset();
-          S.history = ev.history || [];
-          $('summary').textContent = ev.summary;
-          $('lblCount').textContent = ev.rotation_count;
-          if (ev.plot) { $('plot').src = ev.plot; $('plot').style.display = 'block'; }
-          $('progress').value = 100;
-        }
-      }
-    }
+    await readStream(resp, ev => {
+      if (ev.error) { alert(ev.error); return false; }
+      if (ev.progress !== undefined) $('progress').value = Math.max(2, ev.progress * 95);
+      if (ev.preview) livePush(ev.preview);
+      if (ev.done) { liveReset(); showResult(ev, 'main'); $('progress').value = 100; }
+    });
   } catch (e) { alert('Analysis error: ' + e.message); }
   finally {
     S.analyzing = false; btn.disabled = false; btn.textContent = 'Run Full Analysis';
     liveReset();
     badge.classList.remove('active');
     setTimeout(() => $('progress').value = 0, 1200);
+    renderFrame();
   }
 }
 
 async function runFast() {
   if (!S.sid) return alert('Load a video on the Analysis tab first.');
-  if (S.y_top === null || S.y_bottom === null || S.x_left === null || S.x_right === null)
-    return alert('Set TOP, BOTTOM, LEFT, RIGHT boundaries on the Analysis tab first.');
   const cropOn = $('fastCrop').checked;
   if (cropOn && S.cropEnd <= S.cropStart) return alert('End time must be greater than start time.');
   const btn = $('btnFast'), badge = $('fastBadge');
   S.analyzing = true; btn.disabled = true; btn.textContent = 'Analyzing...';
   badge.classList.add('active'); $('fastProgress').value = 1;
   $('fastStatus').textContent = 'Starting...';
+  S.history = []; S.laps = [];
   const p = getParams();
   p.parts = Math.max(1, Math.min(8, +$('fastParts').value || 2));
   if (cropOn) { p.time_start = S.cropStart; p.time_end = S.cropEnd; }
@@ -1339,60 +1302,47 @@ async function runFast() {
       try { m = (await resp.json()).error || m; } catch {}
       return alert(m);
     }
-    const reader = resp.body.getReader(), dec = new TextDecoder();
-    let buf = '';
-    while (true) {
-      const {value, done} = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, {stream: true});
-      let i;
-      while ((i = buf.indexOf('\n\n')) !== -1) {
-        const raw = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
-        if (!raw.startsWith('data:')) continue;
-        let ev; try { ev = JSON.parse(raw.slice(5).trim()); } catch { continue; }
-        if (ev.error) return alert(ev.error);
-        if (ev.progress !== undefined) {
-          $('fastProgress').value = ev.progress * 100;
-          $('fastStatus').textContent =
-            `Processed ${ev.done_frames} / ${ev.total} frames (${ev.parts} parts)`;
-        }
-        if (ev.done) {
-          S.history = ev.history || [];
-          $('fastSummary').textContent = ev.summary; $('summary').textContent = ev.summary;
-          $('lblCount').textContent = ev.rotation_count;
-          if (ev.plot) {
-            $('fastPlot').src = ev.plot; $('fastPlot').style.display = 'block';
-            $('plot').src = ev.plot; $('plot').style.display = 'block';
-          }
-          $('fastProgress').value = 100;
-          $('fastStatus').textContent =
-            `Finished in ${((performance.now() - t0) / 1000).toFixed(1)} s`;
-        }
+    await readStream(resp, ev => {
+      if (ev.error) { alert(ev.error); return false; }
+      if (ev.progress !== undefined) {
+        $('fastProgress').value = ev.progress * 100;
+        $('fastStatus').textContent =
+          `Processed ${ev.done_frames} / ${ev.total} frames (${ev.parts} parts)`;
       }
-    }
+      if (ev.done) {
+        showResult(ev, 'fast');
+        $('fastProgress').value = 100;
+        $('fastStatus').textContent =
+          `Finished in ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+      }
+    });
   } catch (e) { alert('Analysis error: ' + e.message); }
   finally {
     S.analyzing = false; btn.disabled = false; btn.textContent = 'Run Parallel Analysis';
     badge.classList.remove('active');
+    renderFrame();
   }
 }
 
 function resetAnalysis() {
-  S.history = [];
+  S.history = []; S.laps = [];
   $('summary').textContent = 'Run an analysis to see results here.';
-  $('lblCount').textContent = '0'; $('lblState').textContent = '-';
-  $('lblY').textContent = '-'; $('lblExpect').textContent = 'top';
+  $('lblCount').textContent = '0'; $('lblWheel').textContent = '-'; $('lblWheel').className = 'big mid';
+  $('lblTape').textContent = '-'; $('lblTape').className = 'big mid';
+  $('lblY').textContent = '-'; $('lblLaps').textContent = '-';
   $('lblTime').textContent = '0.00s'; $('plot').style.display = 'none';
+  $('lapsWrap').style.display = 'none'; $('lapsBody').innerHTML = '';
   $('progress').value = 0;
   $('fastSummary').textContent = 'Run an analysis to see results here.';
   $('fastPlot').style.display = 'none'; $('fastProgress').value = 0;
   $('fastStatus').textContent = '';
+  if (S.sid) renderFrame();
 }
 
 // ---- CSV ----
 function exportCSV() {
   if (!S.history.length) return alert('Run an analysis first.');
-  const cols = ['frame','time_s','y_position','unwrapped_angle_deg','state','stable_state','rotation_count'];
+  const cols = ['frame','time_s','flywheel','tape','tape_y','phase_deg','rotation_count'];
   const lines = [cols.join(','), ...S.history.map(h => cols.map(c => h[c] ?? '').join(','))];
   const url = URL.createObjectURL(new Blob([lines.join('\n')], {type: 'text/csv'}));
   const a = document.createElement('a'); a.href = url; a.download = 'rotation_data.csv';
@@ -1447,6 +1397,8 @@ function mathsRecalc() {
 }
 $('mR').oninput = $('mG').oninput = mathsRecalc;
 mathsClear();
+
+updateCropBar();
 
 updateCropBar();
 </script>
